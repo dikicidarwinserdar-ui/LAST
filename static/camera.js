@@ -1,22 +1,27 @@
 const QUALITY = {
-  minFocus: 46,
-  minBrightness: 50,
-  maxBrightness: 212,
-  minContrast: 23,
-  maxMotion: 8.2,
-  stableMs: 650,
-  cooldownMs: 1300,
+  minFocus: 42,
+  minBrightness: 48,
+  maxBrightness: 218,
+  minContrast: 20,
+  maxMotion: 9.5,
+  stableMs: 600,
+  cooldownMs: 1200,
   analysisWidth: 360,
   jpegQuality: 0.96,
 
-  minBoxCoverage: 0.10,
-  maxBoxCoverage: 0.92,
-  maxCenterError: 0.29,
-  minAspect: 0.62,
-  maxAspect: 1.55,
-  minInkFill: 0.020,
-  maxInkFill: 0.78,
-  minBoxStability: 0.58
+  minBoxCoverage: 0.055,
+  maxBoxCoverage: 0.94,
+  maxCenterError: 0.34,
+  minAspect: 0.50,
+  maxAspect: 1.85,
+  minInkFill: 0.010,
+  maxInkFill: 0.86,
+  minBoxStability: 0.48,
+
+  smartCropPadding: 0.22,
+  smartCropOutputSize: 1200,
+  minSmartCropSideRatio: 0.18,
+  maxSmartCropSideRatio: 0.96
 };
 
 const MODE_LABELS = {
@@ -37,8 +42,10 @@ const video = document.getElementById("video");
 const overlayCanvas = document.getElementById("overlayCanvas");
 const analysisCanvas = document.getElementById("analysisCanvas");
 const captureCanvas = document.getElementById("captureCanvas");
+
 const cameraPanel = document.getElementById("cameraPanel");
 const pendingPanel = document.getElementById("pendingPanel");
+
 const modeTitle = document.getElementById("modeTitle");
 const modeSubtitle = document.getElementById("modeSubtitle");
 const readyOverlay = document.getElementById("readyOverlay");
@@ -72,11 +79,14 @@ const startModeButtons = Array.from(document.querySelectorAll(".start-mode"));
 let currentMode = null;
 let stream = null;
 let rafId = null;
+
 let previousGray = null;
 let previousBox = null;
+
 let readySince = null;
 let isUploading = false;
 let lastCaptureAt = 0;
+
 let lastMetrics = null;
 let pendingData = null;
 
@@ -92,8 +102,71 @@ function round2(v) {
 }
 
 
+function statusToClassLabel(status) {
+  if (status === "ORIGINAL_APPROVED") {
+    return "ORİJİNAL";
+  }
+
+  if (status === "COPY_RISK_REJECTED") {
+    return "KOPYA / SAHTE RİSKİ";
+  }
+
+  if (status === "RETAKE_REQUIRED") {
+    return "TEKRAR ÇEKİM";
+  }
+
+  if (status === "REFERENCE_READY_TO_SAVE" || status === "REFERENCE_SAVED") {
+    return "REFERANS";
+  }
+
+  if (status === "NO_REFERENCE") {
+    return "REFERANS YOK";
+  }
+
+  return status || "-";
+}
+
+
+function buildDecisionHtml(data) {
+  const status = data.final_user_status || "OK";
+  const classLabel = statusToClassLabel(status);
+  const scores = data.scores || {};
+
+  const base = scores.base_score ?? "-";
+  const adjusted = scores.adjusted_score ?? "-";
+  const risk = scores.copy_risk_score ?? "-";
+  const ssim = scores.ssim_score ?? "-";
+  const iou = scores.mask_iou ?? "-";
+  const edge = scores.edge_f1 ?? "-";
+
+  return `
+    <div style="font-size:18px;font-weight:900;margin-bottom:6px;">
+      ${status}
+    </div>
+
+    <div style="display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.14);font-size:13px;font-weight:900;margin-bottom:8px;">
+      SINIF: ${classLabel}
+    </div>
+
+    <div style="font-size:13px;line-height:1.4;margin-top:8px;margin-bottom:10px;">
+      ${data.final_user_message || ""}
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px;">
+      <div style="background:rgba(255,255,255,0.10);padding:8px;border-radius:10px;"><span style="display:block;font-size:11px;opacity:.75;">Base</span><b>${base}</b></div>
+      <div style="background:rgba(255,255,255,0.10);padding:8px;border-radius:10px;"><span style="display:block;font-size:11px;opacity:.75;">Adjusted</span><b>${adjusted}</b></div>
+      <div style="background:rgba(255,255,255,0.10);padding:8px;border-radius:10px;"><span style="display:block;font-size:11px;opacity:.75;">Copy Risk</span><b>${risk}</b></div>
+      <div style="background:rgba(255,255,255,0.10);padding:8px;border-radius:10px;"><span style="display:block;font-size:11px;opacity:.75;">SSIM</span><b>${ssim}</b></div>
+      <div style="background:rgba(255,255,255,0.10);padding:8px;border-radius:10px;"><span style="display:block;font-size:11px;opacity:.75;">Mask IoU</span><b>${iou}</b></div>
+      <div style="background:rgba(255,255,255,0.10);padding:8px;border-radius:10px;"><span style="display:block;font-size:11px;opacity:.75;">Edge F1</span><b>${edge}</b></div>
+    </div>
+  `;
+}
+
+
 function setOverlay(text, cls) {
   if (!readyOverlay) return;
+
   readyOverlay.textContent = text;
   readyOverlay.className = `ready-overlay ${cls || ""}`.trim();
 }
@@ -152,7 +225,7 @@ function setStatusBox(el, data) {
   }
 
   el.className = `status-box ${cls}`;
-  el.innerHTML = `${status}<br>${data.final_user_message || ""}`;
+  el.innerHTML = buildDecisionHtml(data);
 }
 
 
@@ -196,7 +269,7 @@ async function startCamera(mode) {
   modeSubtitle.textContent = MODE_SUBTITLES[mode] || "";
 
   autoState.textContent = "Kamera açılıyor. Manuel çekim yok; sistem uygun koşulda otomatik çeker.";
-  qualityMessage.textContent = "CDP'yi kameraya göster. Sistem CDP alanını canlıda kutu içine almaya çalışacak.";
+  qualityMessage.textContent = "CDP'yi kameraya göster. Sistem CDP / marker dış alanını canlıda bulmaya çalışacak.";
   setOverlay("Kamera açılıyor", "wait");
 
   try {
@@ -295,6 +368,7 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
   const passStability = boxStability >= QUALITY.minBoxStability;
 
   let score = 0;
+
   score += passCoverage ? 24 : Math.max(0, 24 - Math.abs(coverage - 0.45) * 55);
   score += passAspect ? 22 : Math.max(0, 22 - Math.abs(aspect - 1.0) * 22);
   score += passCenter ? 22 : Math.max(0, 22 - centerError * 55);
@@ -464,6 +538,67 @@ function computeMetrics() {
 }
 
 
+function getVideoDisplayMapping() {
+  const rect = video.getBoundingClientRect();
+
+  const videoRatio = video.videoWidth / Math.max(1, video.videoHeight);
+  const boxRatio = rect.width / Math.max(1, rect.height);
+
+  let drawW;
+  let drawH;
+  let offsetX;
+  let offsetY;
+
+  if (videoRatio > boxRatio) {
+    drawH = rect.height;
+    drawW = drawH * videoRatio;
+    offsetX = (rect.width - drawW) / 2;
+    offsetY = 0;
+  } else {
+    drawW = rect.width;
+    drawH = drawW / videoRatio;
+    offsetX = 0;
+    offsetY = (rect.height - drawH) / 2;
+  }
+
+  return {
+    rect,
+    drawW,
+    drawH,
+    offsetX,
+    offsetY
+  };
+}
+
+
+function mapAnalysisBoxToDisplay(box, metrics) {
+  const map = getVideoDisplayMapping();
+
+  const sx = map.drawW / metrics.aw;
+  const sy = map.drawH / metrics.ah;
+
+  return {
+    x: map.offsetX + box.minX * sx,
+    y: map.offsetY + box.minY * sy,
+    w: box.w * sx,
+    h: box.h * sy
+  };
+}
+
+
+function mapAnalysisBoxToVideoPixels(box, metrics) {
+  const sx = video.videoWidth / metrics.aw;
+  const sy = video.videoHeight / metrics.ah;
+
+  return {
+    x: box.minX * sx,
+    y: box.minY * sy,
+    w: box.w * sx,
+    h: box.h * sy
+  };
+}
+
+
 function drawOverlay(metrics) {
   if (!overlayCanvas || !video) return;
 
@@ -478,13 +613,13 @@ function drawOverlay(metrics) {
   const cw = overlayCanvas.width;
   const ch = overlayCanvas.height;
 
-  const guideSize = Math.min(cw, ch) * 0.66;
+  const guideSize = Math.min(cw, ch) * 0.68;
   const gx = (cw - guideSize) / 2;
   const gy = (ch - guideSize) / 2;
 
   ctx.save();
 
-  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+  ctx.fillStyle = "rgba(0, 0, 0, 0.20)";
   ctx.fillRect(0, 0, cw, ch);
   ctx.clearRect(gx, gy, guideSize, guideSize);
 
@@ -494,28 +629,33 @@ function drawOverlay(metrics) {
   ctx.strokeRect(gx, gy, guideSize, guideSize);
   ctx.setLineDash([]);
 
-  ctx.fillStyle = "rgba(59, 130, 246, 0.98)";
+  ctx.fillStyle = "rgba(59, 130, 246, 1)";
   ctx.font = "bold 15px Arial";
-  ctx.fillText("CDP alanını bu kareye sığdır", gx + 12, gy + 26);
+  ctx.fillText("CDP / marker dış alanını bu kareye getir", gx + 12, gy + 26);
 
   if (metrics && metrics.cdp && metrics.cdp.box) {
     const b = metrics.cdp.box;
+    const displayBox = mapAnalysisBoxToDisplay(b, metrics);
 
-    const sx = cw / metrics.aw;
-    const sy = ch / metrics.ah;
+    const x = displayBox.x;
+    const y = displayBox.y;
+    const w = displayBox.w;
+    const h = displayBox.h;
 
-    const x = b.minX * sx;
-    const y = b.minY * sy;
-    const w = b.w * sx;
-    const h = b.h * sy;
+    const isReady = metrics.passCdp;
+    const isCandidate = metrics.cdp.candidate;
 
-    const color = metrics.cdp.found
+    const color = isReady
       ? "rgba(34, 197, 94, 1)"
-      : "rgba(251, 191, 36, 1)";
+      : isCandidate
+        ? "rgba(251, 191, 36, 1)"
+        : "rgba(248, 113, 113, 1)";
 
-    const fillColor = metrics.cdp.found
+    const fillColor = isReady
       ? "rgba(34, 197, 94, 0.16)"
-      : "rgba(251, 191, 36, 0.16)";
+      : isCandidate
+        ? "rgba(251, 191, 36, 0.16)"
+        : "rgba(248, 113, 113, 0.14)";
 
     ctx.fillStyle = fillColor;
     ctx.fillRect(x, y, w, h);
@@ -525,19 +665,43 @@ function drawOverlay(metrics) {
     ctx.setLineDash([]);
     ctx.strokeRect(x, y, w, h);
 
+    const pad = Math.max(w, h) * QUALITY.smartCropPadding;
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    const smartSide = Math.max(w, h) + pad * 2;
+
+    const sx = Math.max(0, cx - smartSide / 2);
+    const sy = Math.max(0, cy - smartSide / 2);
+    const sside = Math.min(smartSide, cw, ch);
+
+    ctx.strokeStyle = "rgba(168, 85, 247, 0.95)";
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 6]);
+    ctx.strokeRect(sx, sy, sside, sside);
+    ctx.setLineDash([]);
+
     ctx.fillStyle = color;
     ctx.font = "bold 16px Arial";
     ctx.fillText(
-      metrics.cdp.found ? "CDP ALGILANDI - HAZIR" : "CDP ADAYI - AYARLA",
+      isReady ? "CDP ALGILANDI - ÇEKİME HAZIR" : "CDP ADAYI - KAREYE AL",
       x + 8,
       Math.max(24, y - 10)
     );
 
+    ctx.fillStyle = "rgba(168, 85, 247, 1)";
+    ctx.font = "bold 13px Arial";
+    ctx.fillText(
+      "Backend'e gönderilecek dijital zoom alanı",
+      sx + 8,
+      Math.min(ch - 12, sy + sside + 20)
+    );
+
+    ctx.fillStyle = color;
     ctx.font = "13px Arial";
     ctx.fillText(
       `Box ${Math.round(metrics.cdp.score)} | Alan ${(b.coverage * 100).toFixed(0)}% | Oran ${b.aspect.toFixed(2)}`,
       x + 8,
-      Math.min(ch - 12, y + h + 20)
+      Math.min(ch - 34, y + h + 20)
     );
   }
 
@@ -558,7 +722,7 @@ function updateQualityUI(metrics) {
     if (metrics.cdp && metrics.cdp.candidate) {
       issues.push("sarı kutuyu merkeze al, biraz sabit tut");
     } else {
-      issues.push("CDP alanını kare içine al");
+      issues.push("CDP / marker alanını kare içine al");
     }
   }
 
@@ -635,6 +799,94 @@ function analyzeLoop(timestamp) {
 }
 
 
+function buildSmartCaptureCanvas() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+
+  const outputSize = QUALITY.smartCropOutputSize;
+
+  captureCanvas.width = outputSize;
+  captureCanvas.height = outputSize;
+
+  const ctx = captureCanvas.getContext("2d");
+
+  if (!lastMetrics || !lastMetrics.cdp || !lastMetrics.cdp.box) {
+    const side = Math.min(vw, vh);
+    const sx = (vw - side) / 2;
+    const sy = (vh - side) / 2;
+
+    ctx.drawImage(
+      video,
+      sx,
+      sy,
+      side,
+      side,
+      0,
+      0,
+      outputSize,
+      outputSize
+    );
+
+    return {
+      usedSmartCrop: false,
+      reason: "no_cdp_box",
+      sourceX: round2(sx),
+      sourceY: round2(sy),
+      sourceW: round2(side),
+      sourceH: round2(side),
+      outputSize
+    };
+  }
+
+  const b = mapAnalysisBoxToVideoPixels(lastMetrics.cdp.box, lastMetrics);
+
+  const boxCenterX = b.x + b.w / 2;
+  const boxCenterY = b.y + b.h / 2;
+
+  let side = Math.max(b.w, b.h);
+  side = side * (1 + QUALITY.smartCropPadding * 2);
+
+  const minSide = Math.min(vw, vh) * QUALITY.minSmartCropSideRatio;
+  const maxSide = Math.min(vw, vh) * QUALITY.maxSmartCropSideRatio;
+
+  side = Math.max(minSide, Math.min(maxSide, side));
+
+  let sx = boxCenterX - side / 2;
+  let sy = boxCenterY - side / 2;
+
+  sx = Math.max(0, Math.min(vw - side, sx));
+  sy = Math.max(0, Math.min(vh - side, sy));
+
+  ctx.drawImage(
+    video,
+    sx,
+    sy,
+    side,
+    side,
+    0,
+    0,
+    outputSize,
+    outputSize
+  );
+
+  return {
+    usedSmartCrop: true,
+    reason: "cdp_box_smart_crop",
+    sourceX: round2(sx),
+    sourceY: round2(sy),
+    sourceW: round2(side),
+    sourceH: round2(side),
+    outputSize,
+    detectedBoxVideo: {
+      x: round2(b.x),
+      y: round2(b.y),
+      w: round2(b.w),
+      h: round2(b.h)
+    }
+  };
+}
+
+
 async function captureAndPreview() {
   if (!currentMode || isUploading) return;
 
@@ -642,14 +894,7 @@ async function captureAndPreview() {
   setOverlay("Çekiliyor", "ready");
 
   try {
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-
-    captureCanvas.width = vw;
-    captureCanvas.height = vh;
-
-    const ctx = captureCanvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, vw, vh);
+    const smartCropInfo = buildSmartCaptureCanvas();
 
     const blob = await new Promise(resolve => {
       captureCanvas.toBlob(resolve, "image/jpeg", QUALITY.jpegQuality);
@@ -660,10 +905,13 @@ async function captureAndPreview() {
     }
 
     const formData = new FormData();
-    const filename = `${currentMode}_${Date.now()}.jpg`;
+    const filename = `${currentMode}_${Date.now()}_smartcrop.jpg`;
+
+    const qualityPayload = buildQualityPayload();
+    qualityPayload.smartCrop = smartCropInfo;
 
     formData.append("file", blob, filename);
-    formData.append("quality_json", JSON.stringify(buildQualityPayload()));
+    formData.append("quality_json", JSON.stringify(qualityPayload));
 
     const res = await fetch(`/api/preview/${currentMode}`, {
       method: "POST",
@@ -677,6 +925,8 @@ async function captureAndPreview() {
     }
 
     pendingData = data;
+    pendingData.client_quality = qualityPayload;
+
     pendingImage.src = `${data.pending_image_url}?t=${Date.now()}`;
 
     setStatusBox(pendingStatus, data);
@@ -713,7 +963,11 @@ function buildQualityPayload() {
     brightness: round2(lastMetrics.brightness),
     contrast: round2(lastMetrics.contrast),
     motion: round2(lastMetrics.motion),
+
     cdpBoxScore: lastMetrics.cdp ? round2(lastMetrics.cdp.score) : 0,
+    cdpFound: lastMetrics.cdp ? !!lastMetrics.cdp.found : false,
+    cdpCandidate: lastMetrics.cdp ? !!lastMetrics.cdp.candidate : false,
+
     cdpBox: cdpBox
       ? {
           coverage: round2(cdpBox.coverage),
@@ -723,6 +977,16 @@ function buildQualityPayload() {
           boxStability: round2(cdpBox.boxStability)
         }
       : null,
+
+    pass: {
+      focus: !!lastMetrics.passFocus,
+      brightness: !!lastMetrics.passBrightness,
+      contrast: !!lastMetrics.passContrast,
+      motion: !!lastMetrics.passMotion,
+      cdp: !!lastMetrics.passCdp,
+      all: !!lastMetrics.pass
+    },
+
     thresholds: QUALITY
   };
 }
