@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.DS_Store
+outputs/
+uploads/
+*.log
+# Runtime captures can be ignored locally if you do not want to commit test captures.
+# Keep data/references tracked if you want Render to deploy with bundled reference crops.
+data/captures/**
+!data/captures/.gitkeep
