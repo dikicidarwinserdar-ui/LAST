@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 APP_TITLE = "CDP Verify Camera Render"
-APP_VERSION = "3.0.0-backend-crop"
+APP_VERSION = "4.0.0-server-live-detect"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -704,6 +704,81 @@ def api_reload_refs():
     global REFERENCE_CACHE
     REFERENCE_CACHE = load_references()
     return {"reference_count": len(REFERENCE_CACHE), "message": "References reloaded."}
+
+
+
+@app.post("/api/live-detect")
+async def live_detect(file: UploadFile = File(...)):
+    """Fast low-res live detector. Frontend uses this ONLY for guidance/autocapture.
+    Final crop/scoring still happens in /api/preview with full-resolution frame.
+    """
+    if not is_image_file(file.filename or "frame.jpg"):
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+    data = await file.read()
+    try:
+        img = read_image_from_bytes(data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    h, w = img.shape[:2]
+    quad, info, _mask = detect_marker_outer_quad(img)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    focus = float(lap.var())
+
+    found = quad is not None and safe_float(info.get("confidence")) >= 0.38
+    ordered_quad = order_points_clockwise(quad).tolist() if quad is not None else None
+    bbox = None
+    center_error = 1.0
+    coverage = 0.0
+    aspect = 0.0
+    if quad is not None:
+        xs = quad[:, 0]
+        ys = quad[:, 1]
+        x1, x2 = float(np.min(xs)), float(np.max(xs))
+        y1, y2 = float(np.min(ys)), float(np.max(ys))
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        bbox = {"x": x1, "y": y1, "w": bw, "h": bh}
+        coverage = float((bw * bh) / max(1.0, w * h))
+        aspect = float(bw / bh)
+        cx, cy = x1 + bw / 2.0, y1 + bh / 2.0
+        center_error = float(math.sqrt(((cx - w / 2) / w) ** 2 + ((cy - h / 2) / h) ** 2))
+
+    # Capture gate: do not force user to fill screen; require usable geometry + focus + light.
+    pass_focus = focus >= 70.0
+    pass_brightness = 38.0 <= brightness <= 232.0
+    pass_contrast = contrast >= 16.0
+    pass_geometry = bool(found and coverage >= 0.012 and coverage <= 0.86 and center_error <= 0.48)
+    ready = bool(pass_focus and pass_brightness and pass_contrast and pass_geometry)
+
+    guide = {
+        "ready": ready,
+        "found": bool(found),
+        "quad": ordered_quad,
+        "bbox": bbox,
+        "method": info.get("method"),
+        "confidence": safe_float(info.get("confidence")),
+        "marker_count": int(info.get("marker_count", 0) or 0),
+        "coverage": coverage,
+        "aspect": aspect,
+        "center_error": center_error,
+        "focus": focus,
+        "brightness": brightness,
+        "contrast": contrast,
+        "checks": {
+            "focus": pass_focus,
+            "brightness": pass_brightness,
+            "contrast": pass_contrast,
+            "geometry": pass_geometry,
+        },
+        "message": "CDP yakalandı, sabit tut." if ready else "CDP/marker alanını gölge yapmadan göster. Sistem backend'de yakalayacak.",
+        "frame": {"w": w, "h": h},
+    }
+    return JSONResponse(json_safe(guide))
 
 
 @app.post("/api/preview/{mode}")
