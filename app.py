@@ -4,7 +4,7 @@ import math
 import time
 import uuid
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -14,13 +14,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
 APP_TITLE = "CDP Verify Camera Render"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0-backend-crop"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -29,13 +24,15 @@ REFERENCE_DIR = os.path.join(DATA_DIR, "references")
 PENDING_DIR = os.path.join(DATA_DIR, "pending")
 CAPTURE_DIR = os.path.join(DATA_DIR, "captures")
 RECORD_DIR = os.path.join(DATA_DIR, "records")
+DEBUG_DIR = os.path.join(DATA_DIR, "debug")
 
-for d in [DATA_DIR, REFERENCE_DIR, PENDING_DIR, CAPTURE_DIR, RECORD_DIR]:
+for d in [DATA_DIR, REFERENCE_DIR, PENDING_DIR, CAPTURE_DIR, RECORD_DIR, DEBUG_DIR]:
     os.makedirs(d, exist_ok=True)
 
 COMPARE_SIZE = 768
 INNER_BORDER_RATIO = 0.045
-MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+NORMALIZED_SIZE = 1200
+MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VALID_MODES = {"reference", "original", "copy", "test"}
 
@@ -46,11 +43,6 @@ try:
     HAVE_SSIM = True
 except Exception:
     HAVE_SSIM = False
-
-
-# ============================================================
-# APP
-# ============================================================
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -65,10 +57,6 @@ app.add_middleware(
 if os.path.exists(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-
-# ============================================================
-# BASIC UTILS
-# ============================================================
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -104,6 +92,32 @@ def safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def json_safe(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return 0.0
+    return obj
+
+
+def write_json(path: str, data: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(json_safe(data), f, ensure_ascii=False, indent=2)
+
+
+def read_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def pct_drop_from_ref(target_value: float, ref_value: float) -> float:
     target_value = safe_float(target_value)
     ref_value = safe_float(ref_value)
@@ -119,42 +133,6 @@ def pct_gain_from_ref(target_value: float, ref_value: float) -> float:
         return 0.0
     return float(100.0 * (target_value - ref_value) / ref_value)
 
-
-def json_safe(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {str(k): json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [json_safe(v) for v in obj]
-    if isinstance(obj, tuple):
-        return [json_safe(v) for v in obj]
-    if isinstance(obj, (np.floating, np.integer)):
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
-    return obj
-
-
-def write_json(path: str, data: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(json_safe(data), f, ensure_ascii=False, indent=2)
-
-
-def read_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def relative_path(path: str) -> str:
-    return os.path.relpath(path, BASE_DIR)
-
-
-# ============================================================
-# METRICS
-# ============================================================
 
 def safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     a = a.astype(np.float32)
@@ -215,48 +193,219 @@ def grid_similarity(mask_a: np.ndarray, mask_b: np.ndarray, grid: int = 32) -> f
     return float(max(0.0, min(100.0, sim)))
 
 
-def nonlinear_gap_penalty(gap_booster_risk: float) -> float:
-    x = (float(gap_booster_risk) - 45.0) / 8.0
-    penalty = 100.0 / (1.0 + np.exp(-x))
-    return float(penalty)
+def order_points_clockwise(pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float32)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).reshape(-1)
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    ordered[0] = pts[np.argmin(s)]
+    ordered[2] = pts[np.argmax(s)]
+    ordered[1] = pts[np.argmin(diff)]
+    ordered[3] = pts[np.argmax(diff)]
+    return ordered
 
 
-# ============================================================
-# PREPROCESS
-# ============================================================
+def expand_quad_about_center(quad: np.ndarray, scale: float) -> np.ndarray:
+    quad = np.asarray(quad, dtype=np.float32)
+    c = np.mean(quad, axis=0)
+    return c + (quad - c) * scale
+
+
+def warp_quad_to_square(img: np.ndarray, quad: np.ndarray, size: int = NORMALIZED_SIZE) -> np.ndarray:
+    src = order_points_clockwise(quad)
+    dst = np.array([[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]], dtype=np.float32)
+    m = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(img, m, (size, size), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return warped
+
+
+def make_debug_image(img: np.ndarray, quad: Optional[np.ndarray], info: Dict[str, Any], mask_small: Optional[np.ndarray] = None) -> np.ndarray:
+    debug = img.copy()
+    h, w = debug.shape[:2]
+    if quad is not None:
+        q = np.asarray(quad, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(debug, [q], True, (0, 255, 0), max(3, w // 350))
+        for i, p in enumerate(quad.astype(int)):
+            cv2.circle(debug, tuple(p), max(5, w // 220), (0, 0, 255), -1)
+            cv2.putText(debug, str(i), tuple(p + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+    text_lines = [
+        f"method: {info.get('method', '-')}",
+        f"confidence: {info.get('confidence', 0)}",
+        f"markers: {info.get('marker_count', 0)}",
+        f"crop_status: {info.get('crop_status', '-')}",
+    ]
+    y = 34
+    for t in text_lines:
+        cv2.putText(debug, t, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 4, cv2.LINE_AA)
+        cv2.putText(debug, t, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (20, 20, 20), 2, cv2.LINE_AA)
+        y += 34
+    return debug
+
+
+def build_dark_mask_for_detection(img: np.ndarray) -> Tuple[np.ndarray, float]:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    g = clahe.apply(gray)
+    g = cv2.GaussianBlur(g, (5, 5), 0)
+    otsu_t, mask_otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dyn_t = max(35, min(170, float(np.mean(g) - 0.38 * np.std(g))))
+    mask_dyn = (g < dyn_t).astype(np.uint8) * 255
+    mask = cv2.bitwise_or(mask_otsu, mask_dyn)
+    k1 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k1, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k2, iterations=1)
+    return mask, float(otsu_t)
+
+
+def detect_marker_outer_quad(img: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, Any], Optional[np.ndarray]]:
+    h0, w0 = img.shape[:2]
+    max_dim = max(w0, h0)
+    scale = 1.0
+    work = img
+    if max_dim > 1500:
+        scale = 1500.0 / max_dim
+        work = cv2.resize(img, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA)
+
+    h, w = work.shape[:2]
+    mask, otsu_t = build_dark_mask_for_detection(work)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
+    marker_centers = []
+    marker_boxes = []
+    img_area = h * w
+
+    for i in range(1, num_labels):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        ww = int(stats[i, cv2.CC_STAT_WIDTH])
+        hh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < max(14, img_area * 0.000025):
+            continue
+        if area > img_area * 0.12:
+            continue
+        aspect = ww / max(1, hh)
+        fill = area / max(1, ww * hh)
+        if 0.35 <= aspect <= 2.85 and fill >= 0.18:
+            cx, cy = centroids[i]
+            if 0.02 * w <= cx <= 0.98 * w and 0.02 * h <= cy <= 0.98 * h:
+                marker_centers.append([float(cx), float(cy)])
+                marker_boxes.append([x, y, ww, hh, area, aspect, fill])
+
+    info: Dict[str, Any] = {
+        "method": "none",
+        "confidence": 0.0,
+        "marker_count": len(marker_centers),
+        "otsu_threshold": otsu_t,
+        "crop_status": "not_found",
+    }
+
+    if len(marker_centers) >= 5:
+        centers = np.array(marker_centers, dtype=np.float32)
+        rect = cv2.minAreaRect(centers)
+        box = cv2.boxPoints(rect).astype(np.float32)
+        box = expand_quad_about_center(box, 1.34)
+        box = box / scale
+        box[:, 0] = np.clip(box[:, 0], 0, w0 - 1)
+        box[:, 1] = np.clip(box[:, 1], 0, h0 - 1)
+        rw, rh = rect[1]
+        rect_area = max(1.0, float(rw * rh))
+        coverage = rect_area / max(1.0, img_area)
+        info.update({
+            "method": "marker_component_min_area_rect",
+            "confidence": float(min(1.0, 0.42 + len(marker_centers) / 18.0)),
+            "marker_rect_coverage": float(coverage),
+            "crop_status": "ok",
+        })
+        return box, info, mask
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < img_area * 0.015 or area > img_area * 0.94:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.035 * peri, True)
+        x, y, ww, hh = cv2.boundingRect(c)
+        aspect = ww / max(1, hh)
+        if 0.45 <= aspect <= 2.2:
+            candidates.append((area, approx, c, (x, y, ww, hh)))
+
+    if candidates:
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        area, approx, contour, rect_xywh = candidates[0]
+        if len(approx) == 4:
+            box = approx.reshape(4, 2).astype(np.float32)
+            method = "largest_quad_contour"
+        else:
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect).astype(np.float32)
+            method = "largest_contour_min_area_rect"
+        box = expand_quad_about_center(box, 1.16)
+        box = box / scale
+        box[:, 0] = np.clip(box[:, 0], 0, w0 - 1)
+        box[:, 1] = np.clip(box[:, 1], 0, h0 - 1)
+        info.update({"method": method, "confidence": 0.62, "contour_area_ratio": float(area / img_area), "crop_status": "ok"})
+        return box, info, mask
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) > img_area * 0.006:
+        x1, x2 = float(xs.min()), float(xs.max())
+        y1, y2 = float(ys.min()), float(ys.max())
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        side = max(x2 - x1, y2 - y1) * 1.35
+        x1 = max(0.0, cx - side / 2)
+        y1 = max(0.0, cy - side / 2)
+        x2 = min(float(w - 1), cx + side / 2)
+        y2 = min(float(h - 1), cy + side / 2)
+        box = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32) / scale
+        info.update({"method": "dark_pixel_square_bbox_fallback", "confidence": 0.38, "crop_status": "fallback"})
+        return box, info, mask
+
+    return None, info, mask
+
+
+def normalize_cdp_from_full_frame(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    quad, info, mask = detect_marker_outer_quad(img)
+    if quad is not None:
+        crop = warp_quad_to_square(img, quad, NORMALIZED_SIZE)
+        debug = make_debug_image(img, quad, info, mask)
+        return crop, debug, info
+
+    h, w = img.shape[:2]
+    side = min(h, w)
+    x = (w - side) // 2
+    y = (h - side) // 2
+    crop = img[y:y + side, x:x + side]
+    crop = cv2.resize(crop, (NORMALIZED_SIZE, NORMALIZED_SIZE), interpolation=cv2.INTER_CUBIC)
+    info = {"method": "center_square_last_fallback", "confidence": 0.0, "marker_count": 0, "crop_status": "fallback_no_detection"}
+    quad = np.array([[x, y], [x + side, y], [x + side, y + side], [x, y + side]], dtype=np.float32)
+    debug = make_debug_image(img, quad, info, mask)
+    return crop, debug, info
+
 
 def preprocess_cdp_image(img: np.ndarray) -> Dict[str, Any]:
     img = cv2.resize(img, (COMPARE_SIZE, COMPARE_SIZE), interpolation=cv2.INTER_CUBIC)
-
     border = int(COMPARE_SIZE * INNER_BORDER_RATIO)
     if border > 0:
         img = img[border:-border, border:-border]
     img = cv2.resize(img, (COMPARE_SIZE, COMPARE_SIZE), interpolation=cv2.INTER_CUBIC)
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     bg = cv2.GaussianBlur(gray, (0, 0), 35)
     norm = cv2.divide(gray, bg, scale=255)
-
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     norm = clahe.apply(norm)
-
     norm_blur = cv2.GaussianBlur(norm, (3, 3), 0)
-
-    _, binary_inv = cv2.threshold(
-        norm_blur,
-        0,
-        255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-
+    _, binary_inv = cv2.threshold(norm_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     binary = (binary_inv > 0).astype(np.uint8)
     edges = cv2.Canny(norm_blur, 60, 160)
     edges_bin = (edges > 0).astype(np.uint8)
 
     lap = cv2.Laplacian(norm, cv2.CV_64F)
     lap_var = float(lap.var())
-
     gx = cv2.Sobel(norm, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(norm, cv2.CV_64F, 0, 1, ksize=3)
     grad_mag = np.sqrt(gx * gx + gy * gy)
@@ -266,7 +415,6 @@ def preprocess_cdp_image(img: np.ndarray) -> Dict[str, Any]:
     dilated = cv2.dilate(binary, kernel, iterations=1)
     eroded = cv2.erode(binary, kernel, iterations=1)
     boundary = ((dilated - eroded) > 0)
-
     if np.sum(boundary) > 0:
         edge_acutance = float(np.mean(grad_mag[boundary]))
         boundary_pixels = norm[boundary]
@@ -302,7 +450,6 @@ def preprocess_cdp_image(img: np.ndarray) -> Dict[str, Any]:
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area >= 2:
             areas.append(area)
-
     if len(areas) == 0:
         component_count = 0
         component_area_mean = 0.0
@@ -341,10 +488,6 @@ def preprocess_cdp_image(img: np.ndarray) -> Dict[str, Any]:
         "component_area_max": component_area_max,
     }
 
-
-# ============================================================
-# SCORING
-# ============================================================
 
 def score_pair(target: Dict[str, Any], ref: Dict[str, Any]) -> Dict[str, Any]:
     norm_t = target["norm_float"]
@@ -385,9 +528,6 @@ def score_pair(target: Dict[str, Any], ref: Dict[str, Any]) -> Dict[str, Any]:
 
     black_gain_abs = float(target["black_ratio"] - ref["black_ratio"])
     black_gain_pct = pct_gain_from_ref(target["black_ratio"], ref["black_ratio"])
-    white_loss_abs = float(ref["white_ratio"] - target["white_ratio"])
-    white_loss_pct = pct_drop_from_ref(target["white_ratio"], ref["white_ratio"])
-    bw_ratio_gain_pct = pct_gain_from_ref(target["black_white_ratio"], ref["black_white_ratio"])
     transition_gain_abs = float(target["transition_softness"] - ref["transition_softness"])
     transition_gain_pct = pct_gain_from_ref(target["transition_softness"], ref["transition_softness"])
 
@@ -405,44 +545,13 @@ def score_pair(target: Dict[str, Any], ref: Dict[str, Any]) -> Dict[str, Any]:
         0.10 * transition_component
     )
     copy_risk_score = float(max(0.0, min(100.0, copy_risk_score)))
-
     adjusted_score = base_score - (0.20 * copy_risk_score)
     adjusted_score = float(max(0.0, min(100.0, adjusted_score)))
-
-    black_auc_gain = float(target["black_auc"] - ref["black_auc"])
-    black_curve_l1 = float(np.mean(np.abs(target["black_curve"] - ref["black_curve"])))
-    black_curve_risk = np.clip(black_auc_gain / 0.035, 0, 1) * 100.0
-    black_curve_diff_risk = np.clip(black_curve_l1 / 0.045, 0, 1) * 100.0
-
-    hf_drop_pct = pct_drop_from_ref(target["highfreq_energy"], ref["highfreq_energy"])
-    hf_p90_drop_pct = pct_drop_from_ref(target["highfreq_p90"], ref["highfreq_p90"])
-    hf_risk = np.clip(hf_drop_pct / 35.0, 0, 1) * 100.0
-    hf_p90_risk = np.clip(hf_p90_drop_pct / 35.0, 0, 1) * 100.0
-
-    component_count_drop_pct = pct_drop_from_ref(target["component_count"], ref["component_count"])
-    component_area_gain_pct = pct_gain_from_ref(target["component_area_mean"], ref["component_area_mean"])
-    component_area_p90_gain_pct = pct_gain_from_ref(target["component_area_p90"], ref["component_area_p90"])
-    component_count_risk = np.clip(component_count_drop_pct / 25.0, 0, 1) * 100.0
-    component_area_risk = np.clip(component_area_gain_pct / 40.0, 0, 1) * 100.0
-    component_p90_risk = np.clip(component_area_p90_gain_pct / 45.0, 0, 1) * 100.0
-
-    gap_booster_risk = (
-        0.25 * black_curve_risk +
-        0.15 * black_curve_diff_risk +
-        0.20 * hf_risk +
-        0.10 * hf_p90_risk +
-        0.15 * component_count_risk +
-        0.10 * component_area_risk +
-        0.05 * component_p90_risk
-    )
-    gap_booster_risk = float(max(0.0, min(100.0, gap_booster_risk)))
 
     return {
         "base_score": base_score,
         "adjusted_score": adjusted_score,
         "copy_risk_score": copy_risk_score,
-        "gap_booster_risk": gap_booster_risk,
-        "gap_nonlinear_penalty": nonlinear_gap_penalty(gap_booster_risk),
         "ssim_score": ssim_score,
         "corr_score": corr_score,
         "absdiff_score": absdiff_score,
@@ -452,21 +561,11 @@ def score_pair(target: Dict[str, Any], ref: Dict[str, Any]) -> Dict[str, Any]:
         "edge_f1": edge_f1,
         "black_gain_abs": black_gain_abs,
         "black_gain_pct": black_gain_pct,
-        "white_loss_abs": white_loss_abs,
-        "white_loss_pct": white_loss_pct,
-        "bw_ratio_gain_pct": bw_ratio_gain_pct,
         "lap_drop_pct": lap_drop_pct,
         "tenengrad_drop_pct": tenengrad_drop_pct,
         "edge_acutance_drop_pct": edge_acutance_drop_pct,
         "transition_gain_abs": transition_gain_abs,
         "transition_gain_pct": transition_gain_pct,
-        "black_auc_gain": black_auc_gain,
-        "black_curve_l1": black_curve_l1,
-        "hf_drop_pct": hf_drop_pct,
-        "hf_p90_drop_pct": hf_p90_drop_pct,
-        "component_count_drop_pct": component_count_drop_pct,
-        "component_area_gain_pct": component_area_gain_pct,
-        "component_area_p90_gain_pct": component_area_p90_gain_pct,
     }
 
 
@@ -483,84 +582,38 @@ def final_decision(row: Dict[str, Any]) -> Dict[str, Any]:
     ten_drop = safe_float(row.get("tenengrad_drop_pct"))
     edge_drop = safe_float(row.get("edge_acutance_drop_pct"))
 
-    very_strong_original = (
-        base >= 86.0 and adjusted >= 80.0 and risk < 30.0 and
-        ssim >= 74.0 and corr >= 92.0 and mask_iou >= 85.0 and edge_f1 >= 48.0
-    )
-    strong_original = (
-        base >= 78.0 and adjusted >= 72.0 and risk < 46.0 and
-        ssim >= 58.0 and corr >= 87.0 and mask_iou >= 76.0 and edge_f1 >= 36.0
-    )
-    strong_original_with_negative_black_gain = (
-        base >= 80.0 and adjusted >= 68.0 and black_gain < 0.0 and
-        ssim >= 62.0 and corr >= 88.0 and mask_iou >= 78.0 and edge_f1 >= 38.0 and risk < 60.0
-    )
-
-    if very_strong_original or strong_original or strong_original_with_negative_black_gain:
-        return {
-            "final_user_status": "ORIGINAL_APPROVED",
-            "final_user_message": "Ürün doğrulandı. CDP deseni orijinal referans ile güçlü şekilde eşleşiyor.",
-            "final_reason": "strong_original_match",
-        }
+    if base >= 86.0 and adjusted >= 80.0 and risk < 30.0 and ssim >= 74.0 and corr >= 92.0 and mask_iou >= 85.0 and edge_f1 >= 48.0:
+        return {"final_user_status": "ORIGINAL_APPROVED", "final_user_message": "Ürün doğrulandı. CDP deseni orijinal referans ile güçlü şekilde eşleşiyor.", "final_reason": "very_strong_original"}
+    if base >= 78.0 and adjusted >= 72.0 and risk < 46.0 and ssim >= 58.0 and corr >= 87.0 and mask_iou >= 76.0 and edge_f1 >= 36.0:
+        return {"final_user_status": "ORIGINAL_APPROVED", "final_user_message": "Ürün doğrulandı. CDP deseni orijinal referans ile güçlü şekilde eşleşiyor.", "final_reason": "strong_original"}
+    if base >= 80.0 and adjusted >= 68.0 and black_gain < 0.0 and ssim >= 62.0 and corr >= 88.0 and mask_iou >= 78.0 and edge_f1 >= 38.0 and risk < 60.0:
+        return {"final_user_status": "ORIGINAL_APPROVED", "final_user_message": "Ürün doğrulandı. CDP deseni orijinal referans ile güçlü şekilde eşleşiyor.", "final_reason": "strong_original_negative_black_gain"}
 
     if base < 69.5 and ssim < 42.0 and edge_f1 < 32.0:
-        return {
-            "final_user_status": "COPY_RISK_REJECTED",
-            "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP deseni orijinal referans ile yeterli eşleşmiyor.",
-            "final_reason": f"very_low_similarity:base={base:.2f},ssim={ssim:.2f},edge={edge_f1:.2f}",
-        }
+        return {"final_user_status": "COPY_RISK_REJECTED", "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP deseni orijinal referans ile yeterli eşleşmiyor.", "final_reason": f"very_low_similarity:base={base:.2f},ssim={ssim:.2f},edge={edge_f1:.2f}"}
     if base < 72.5 and ssim < 50.0 and edge_f1 < 35.0 and mask_iou < 73.0:
-        return {
-            "final_user_status": "COPY_RISK_REJECTED",
-            "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP mikro detayları orijinal referanstan belirgin şekilde farklı.",
-            "final_reason": f"low_micro_similarity:base={base:.2f},ssim={ssim:.2f},iou={mask_iou:.2f},edge={edge_f1:.2f}",
-        }
+        return {"final_user_status": "COPY_RISK_REJECTED", "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP mikro detayları orijinal referanstan belirgin şekilde farklı.", "final_reason": f"low_micro_similarity:base={base:.2f},ssim={ssim:.2f},iou={mask_iou:.2f},edge={edge_f1:.2f}"}
     if black_gain > 0.030 and edge_drop > 12.0 and ssim < 55.0 and adjusted < 76.0:
-        return {
-            "final_user_status": "COPY_RISK_REJECTED",
-            "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP üzerinde siyah alan artışı ve kenar yumuşaması var.",
-            "final_reason": f"black_gain_plus_edge_softening:black_gain={black_gain:.4f},edge_drop={edge_drop:.2f}",
-        }
+        return {"final_user_status": "COPY_RISK_REJECTED", "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP üzerinde siyah alan artışı ve kenar yumuşaması var.", "final_reason": f"black_gain_plus_edge_softening:black_gain={black_gain:.4f},edge_drop={edge_drop:.2f}"}
     if black_gain > 0.025 and ten_drop > 18.0 and ssim < 55.0 and adjusted < 76.0:
-        return {
-            "final_user_status": "COPY_RISK_REJECTED",
-            "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP üzerinde siyah alan artışı ve detay kaybı var.",
-            "final_reason": f"black_gain_plus_tenengrad_drop:black_gain={black_gain:.4f},ten_drop={ten_drop:.2f}",
-        }
+        return {"final_user_status": "COPY_RISK_REJECTED", "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP üzerinde siyah alan artışı ve detay kaybı var.", "final_reason": f"black_gain_plus_tenengrad_drop:black_gain={black_gain:.4f},ten_drop={ten_drop:.2f}"}
     if adjusted < 66.0 and risk > 55.0 and ssim < 55.0 and edge_f1 < 36.0 and black_gain > -0.010:
-        return {
-            "final_user_status": "COPY_RISK_REJECTED",
-            "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP mikro detayları orijinal referanstan belirgin şekilde farklı.",
-            "final_reason": f"high_risk_weak_micro:risk={risk:.2f},adjusted={adjusted:.2f}",
-        }
+        return {"final_user_status": "COPY_RISK_REJECTED", "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP mikro detayları orijinal referanstan belirgin şekilde farklı.", "final_reason": f"high_risk_weak_micro:risk={risk:.2f},adjusted={adjusted:.2f}"}
     if adjusted < 62.0 and risk > 60.0 and ssim < 52.0 and edge_drop > 24.0 and ten_drop > 35.0:
-        return {
-            "final_user_status": "COPY_RISK_REJECTED",
-            "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP detay keskinliği orijinal referansa göre belirgin düşük.",
-            "final_reason": f"sharpness_only_copy_signal:risk={risk:.2f},adjusted={adjusted:.2f}",
-        }
+        return {"final_user_status": "COPY_RISK_REJECTED", "final_user_message": "Yüksek kopya/sahte riski tespit edildi. CDP detay keskinliği orijinal referansa göre belirgin düşük.", "final_reason": f"sharpness_only_copy_signal:risk={risk:.2f},adjusted={adjusted:.2f}"}
     if black_gain < 0 and (lap_drop > 35.0 or ten_drop > 30.0 or edge_drop > 14.0):
-        return {
-            "final_user_status": "RETAKE_REQUIRED",
-            "final_user_message": "Fotoğraf netliği düşük görünüyor. Lütfen CDP alanını daha net ve sabit şekilde tekrar çekin.",
-            "final_reason": "low_sharpness_retake",
-        }
+        return {"final_user_status": "RETAKE_REQUIRED", "final_user_message": "Fotoğraf netliği düşük görünüyor. Lütfen CDP alanını daha net ve sabit şekilde tekrar çekin.", "final_reason": "low_sharpness_retake"}
     if base < 78.0 or ssim < 58.0 or mask_iou < 76.0 or edge_f1 < 36.0:
-        return {
-            "final_user_status": "RETAKE_REQUIRED",
-            "final_user_message": "CDP eşleşmesi sınırda kaldı. Lütfen daha iyi ışıkta, CDP tam kadrajda olacak şekilde tekrar çekin.",
-            "final_reason": "borderline_similarity_retake",
-        }
-    return {
-        "final_user_status": "RETAKE_REQUIRED",
-        "final_user_message": "Görüntü kalitesi veya eşleşme skoru sınırda. Lütfen tekrar çekin.",
-        "final_reason": "generic_review",
-    }
+        return {"final_user_status": "RETAKE_REQUIRED", "final_user_message": "CDP eşleşmesi sınırda kaldı. Lütfen daha iyi ışıkta, CDP tam kadrajda olacak şekilde tekrar çekin.", "final_reason": "borderline_similarity_retake"}
+    return {"final_user_status": "RETAKE_REQUIRED", "final_user_message": "Görüntü kalitesi veya eşleşme skoru sınırda. Lütfen tekrar çekin.", "final_reason": "generic_review"}
 
 
-# ============================================================
-# REFERENCES AND RECORDS
-# ============================================================
+def compact_scores(best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not best:
+        return {}
+    keys = ["base_score", "adjusted_score", "copy_risk_score", "ssim_score", "corr_score", "mask_f1", "mask_iou", "grid_score", "edge_f1", "black_gain_abs", "black_gain_pct", "lap_drop_pct", "tenengrad_drop_pct", "edge_acutance_drop_pct"]
+    return {k: round(safe_float(best[k]), 6 if k == "black_gain_abs" else 4) for k in keys if k in best}
+
 
 def load_references() -> List[Dict[str, Any]]:
     refs = []
@@ -577,12 +630,7 @@ def load_references() -> List[Dict[str, Any]]:
         parts = name.split("__")
         if len(parts) >= 2:
             image_id = parts[1]
-        refs.append({
-            "ref_file": name,
-            "ref_image_id": image_id,
-            "ref_path": path,
-            "prep": prep,
-        })
+        refs.append({"ref_file": name, "ref_image_id": image_id, "ref_path": path, "prep": prep})
     return refs
 
 
@@ -590,11 +638,6 @@ def ensure_references_loaded() -> None:
     global REFERENCE_CACHE
     if len(REFERENCE_CACHE) == 0:
         REFERENCE_CACHE = load_references()
-
-
-def summarize_reference_count() -> int:
-    ensure_references_loaded()
-    return len(REFERENCE_CACHE)
 
 
 def score_against_references(target_prep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -613,23 +656,6 @@ def score_against_references(target_prep: Dict[str, Any]) -> Optional[Dict[str, 
     return {"best": best, "top_refs": top_refs, "decision": decision}
 
 
-def compact_scores(best: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not best:
-        return {}
-    keys = [
-        "base_score", "adjusted_score", "copy_risk_score", "gap_booster_risk", "gap_nonlinear_penalty",
-        "ssim_score", "corr_score", "mask_f1", "mask_iou", "grid_score", "edge_f1",
-        "black_gain_abs", "black_gain_pct", "lap_drop_pct", "tenengrad_drop_pct", "edge_acutance_drop_pct",
-        "black_auc_gain", "black_curve_l1", "hf_drop_pct", "component_count_drop_pct", "component_area_gain_pct"
-    ]
-    rounded = {}
-    for k in keys:
-        if k in best:
-            precision = 6 if k in ["black_gain_abs", "black_auc_gain", "black_curve_l1"] else 4
-            rounded[k] = round(safe_float(best[k]), precision)
-    return rounded
-
-
 def list_saved_records() -> List[Dict[str, Any]]:
     records = []
     if not os.path.exists(RECORD_DIR):
@@ -639,17 +665,12 @@ def list_saved_records() -> List[Dict[str, Any]]:
             continue
         path = os.path.join(RECORD_DIR, name)
         try:
-            rec = read_json(path)
-            records.append(rec)
+            records.append(read_json(path))
         except Exception:
-            continue
+            pass
     records.sort(key=lambda r: r.get("created_at", 0), reverse=True)
     return records
 
-
-# ============================================================
-# ROUTES
-# ============================================================
 
 @app.on_event("startup")
 def startup_event():
@@ -669,26 +690,13 @@ def index():
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "app": APP_TITLE,
-        "version": APP_VERSION,
-        "reference_count": len(REFERENCE_CACHE),
-        "records": len(list_saved_records()),
-        "time": time.time(),
-    }
+    return {"ok": True, "app": APP_TITLE, "version": APP_VERSION, "reference_count": len(REFERENCE_CACHE), "records": len(list_saved_records()), "time": time.time()}
 
 
 @app.get("/api/refs")
 def api_refs():
     ensure_references_loaded()
-    return {
-        "reference_count": len(REFERENCE_CACHE),
-        "references": [
-            {"ref_file": r["ref_file"], "ref_image_id": r["ref_image_id"]}
-            for r in REFERENCE_CACHE
-        ]
-    }
+    return {"reference_count": len(REFERENCE_CACHE), "references": [{"ref_file": r["ref_file"], "ref_image_id": r["ref_image_id"]} for r in REFERENCE_CACHE]}
 
 
 @app.post("/api/reload-refs")
@@ -699,52 +707,43 @@ def api_reload_refs():
 
 
 @app.post("/api/preview/{mode}")
-async def api_preview_capture(
-    mode: str,
-    file: UploadFile = File(...),
-    quality_json: str = Form(default="{}")
-):
+async def api_preview_capture(mode: str, file: UploadFile = File(...), quality_json: str = Form(default="{}")):
     if mode not in VALID_MODES:
         raise HTTPException(status_code=400, detail="Invalid mode.")
-
     raw = await file.read()
     if len(raw) == 0:
         raise HTTPException(status_code=400, detail="Empty file.")
-
     try:
-        img = read_image_from_bytes(raw)
+        full_img = read_image_from_bytes(raw)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     try:
         client_quality = json.loads(quality_json) if quality_json else {}
     except Exception:
         client_quality = {}
 
+    normalized_img, debug_img, crop_info = normalize_cdp_from_full_frame(full_img)
+
     capture_id = new_id(mode)
-    pending_img_path = os.path.join(PENDING_DIR, f"{capture_id}.jpg")
+    pending_full_path = os.path.join(PENDING_DIR, f"{capture_id}_full.jpg")
+    pending_crop_path = os.path.join(PENDING_DIR, f"{capture_id}.jpg")
+    pending_debug_path = os.path.join(PENDING_DIR, f"{capture_id}_debug.jpg")
     pending_json_path = os.path.join(PENDING_DIR, f"{capture_id}.json")
 
-    cv2.imwrite(pending_img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
+    cv2.imwrite(pending_full_path, full_img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
+    cv2.imwrite(pending_crop_path, normalized_img, [int(cv2.IMWRITE_JPEG_QUALITY), 96])
+    cv2.imwrite(pending_debug_path, debug_img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
 
-    target_prep = preprocess_cdp_image(img)
+    target_prep = preprocess_cdp_image(normalized_img)
 
     if mode == "reference":
-        decision = {
-            "final_user_status": "REFERENCE_READY_TO_SAVE",
-            "final_user_message": "Referans otomatik çekildi. Kontrol edip kaydedebilirsin.",
-            "final_reason": "reference_preview",
-        }
+        decision = {"final_user_status": "REFERENCE_READY_TO_SAVE", "final_user_message": "Referans otomatik çekildi ve backend marker/CDP crop yaptı. Kontrol edip kaydedebilirsin.", "final_reason": "reference_preview_backend_crop"}
         best = None
         top_refs = []
     else:
         scored = score_against_references(target_prep)
         if scored is None:
-            decision = {
-                "final_user_status": "NO_REFERENCE",
-                "final_user_message": "Henüz kayıtlı referans yok. Önce referans çekip kaydet.",
-                "final_reason": "missing_reference",
-            }
+            decision = {"final_user_status": "NO_REFERENCE", "final_user_message": "Henüz kayıtlı referans yok. Önce referans çekip kaydet.", "final_reason": "missing_reference"}
             best = None
             top_refs = []
         else:
@@ -758,7 +757,10 @@ async def api_preview_capture(
         "input_file": file.filename,
         "saved": False,
         "pending_image_url": f"/api/pending/{capture_id}/image",
-        "reference_count": summarize_reference_count(),
+        "pending_crop_url": f"/api/pending/{capture_id}/image",
+        "pending_full_image_url": f"/api/pending/{capture_id}/full",
+        "server_debug_image_url": f"/api/pending/{capture_id}/debug",
+        "reference_count": len(REFERENCE_CACHE),
         "final_user_status": decision["final_user_status"],
         "final_user_message": decision["final_user_message"],
         "final_reason": decision["final_reason"],
@@ -766,23 +768,10 @@ async def api_preview_capture(
         "best_ref_file": best.get("ref_file") if best else None,
         "scores": compact_scores(best),
         "client_quality": client_quality,
-        "top_refs": [
-            {
-                "ref_image_id": r["ref_image_id"],
-                "ref_file": r["ref_file"],
-                "base_score": round(safe_float(r.get("base_score")), 4),
-                "adjusted_score": round(safe_float(r.get("adjusted_score")), 4),
-                "copy_risk_score": round(safe_float(r.get("copy_risk_score")), 4),
-                "gap_booster_risk": round(safe_float(r.get("gap_booster_risk")), 4),
-                "ssim_score": round(safe_float(r.get("ssim_score")), 4),
-                "mask_iou": round(safe_float(r.get("mask_iou")), 4),
-                "edge_f1": round(safe_float(r.get("edge_f1")), 4),
-            }
-            for r in top_refs
-        ],
+        "server_crop": crop_info,
+        "top_refs": [{"ref_image_id": r["ref_image_id"], "ref_file": r["ref_file"], "base_score": round(safe_float(r.get("base_score")), 4), "adjusted_score": round(safe_float(r.get("adjusted_score")), 4), "copy_risk_score": round(safe_float(r.get("copy_risk_score")), 4), "ssim_score": round(safe_float(r.get("ssim_score")), 4), "mask_iou": round(safe_float(r.get("mask_iou")), 4), "edge_f1": round(safe_float(r.get("edge_f1")), 4)} for r in top_refs],
         "created_at": time.time(),
     }
-
     write_json(pending_json_path, response)
     return JSONResponse(json_safe(response))
 
@@ -790,35 +779,45 @@ async def api_preview_capture(
 @app.post("/api/save/{capture_id}")
 def api_save_capture(capture_id: str):
     global REFERENCE_CACHE
-
-    pending_img_path = os.path.join(PENDING_DIR, f"{capture_id}.jpg")
+    pending_crop_path = os.path.join(PENDING_DIR, f"{capture_id}.jpg")
+    pending_full_path = os.path.join(PENDING_DIR, f"{capture_id}_full.jpg")
+    pending_debug_path = os.path.join(PENDING_DIR, f"{capture_id}_debug.jpg")
     pending_json_path = os.path.join(PENDING_DIR, f"{capture_id}.json")
-
-    if not os.path.exists(pending_img_path) or not os.path.exists(pending_json_path):
+    if not os.path.exists(pending_crop_path) or not os.path.exists(pending_json_path):
         raise HTTPException(status_code=404, detail="Pending capture not found.")
-
     meta = read_json(pending_json_path)
     mode = meta.get("mode")
     if mode not in VALID_MODES:
         raise HTTPException(status_code=400, detail="Invalid pending mode.")
 
     record_id = new_id(f"rec_{mode}")
-
     if mode == "reference":
         final_dir = REFERENCE_DIR
         final_name = f"reference__{record_id}.jpg"
     else:
         final_dir = os.path.join(CAPTURE_DIR, mode)
         final_name = f"{record_id}.jpg"
-
     os.makedirs(final_dir, exist_ok=True)
     final_img_path = os.path.join(final_dir, final_name)
-    shutil.copyfile(pending_img_path, final_img_path)
+    shutil.copyfile(pending_crop_path, final_img_path)
+
+    final_full_path = None
+    final_debug_path = None
+    if os.path.exists(pending_full_path):
+        full_dir = os.path.join(CAPTURE_DIR, "full")
+        os.makedirs(full_dir, exist_ok=True)
+        final_full_path = os.path.join(full_dir, f"{record_id}_full.jpg")
+        shutil.copyfile(pending_full_path, final_full_path)
+    if os.path.exists(pending_debug_path):
+        debug_dir = os.path.join(CAPTURE_DIR, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        final_debug_path = os.path.join(debug_dir, f"{record_id}_debug.jpg")
+        shutil.copyfile(pending_debug_path, final_debug_path)
 
     if mode == "reference":
         meta["final_user_status"] = "REFERENCE_SAVED"
-        meta["final_user_message"] = "Referans CDP kaydedildi. Bundan sonraki testler bu referansa göre karşılaştırılacak."
-        meta["final_reason"] = "reference_saved"
+        meta["final_user_message"] = "Referans CDP normalize/crop edilerek kaydedildi. Bundan sonraki testler bu referansa göre karşılaştırılacak."
+        meta["final_reason"] = "reference_saved_backend_crop"
         REFERENCE_CACHE = load_references()
 
     record = {
@@ -827,31 +826,32 @@ def api_save_capture(capture_id: str):
         "mode": mode,
         "created_at": time.time(),
         "image_path": final_img_path,
+        "full_image_path": final_full_path,
+        "debug_image_path": final_debug_path,
         "image_url": f"/api/records/{record_id}/image",
+        "debug_image_url": f"/api/records/{record_id}/debug" if final_debug_path else None,
         "file_name": final_name,
         "reference_count_after_save": len(REFERENCE_CACHE),
         **meta,
         "saved": True,
         "saved_image_url": f"/api/records/{record_id}/image",
     }
+    write_json(os.path.join(RECORD_DIR, f"{record_id}.json"), record)
 
-    record_json_path = os.path.join(RECORD_DIR, f"{record_id}.json")
-    write_json(record_json_path, record)
-
-    try:
-        os.remove(pending_img_path)
-        os.remove(pending_json_path)
-    except Exception:
-        pass
-
+    for p in [pending_crop_path, pending_full_path, pending_debug_path, pending_json_path]:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
     return JSONResponse(json_safe(record))
 
 
 @app.delete("/api/pending/{capture_id}")
 def api_delete_pending(capture_id: str):
     deleted = False
-    for ext in [".jpg", ".json"]:
-        p = os.path.join(PENDING_DIR, f"{capture_id}{ext}")
+    for suffix in [".jpg", "_full.jpg", "_debug.jpg", ".json"]:
+        p = os.path.join(PENDING_DIR, f"{capture_id}{suffix}")
         if os.path.exists(p):
             os.remove(p)
             deleted = True
@@ -862,7 +862,23 @@ def api_delete_pending(capture_id: str):
 def api_pending_image(capture_id: str):
     path = os.path.join(PENDING_DIR, f"{capture_id}.jpg")
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Pending image not found.")
+        raise HTTPException(status_code=404, detail="Pending crop image not found.")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/pending/{capture_id}/full")
+def api_pending_full_image(capture_id: str):
+    path = os.path.join(PENDING_DIR, f"{capture_id}_full.jpg")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Pending full image not found.")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/pending/{capture_id}/debug")
+def api_pending_debug_image(capture_id: str):
+    path = os.path.join(PENDING_DIR, f"{capture_id}_debug.jpg")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Pending debug image not found.")
     return FileResponse(path, media_type="image/jpeg")
 
 
@@ -876,12 +892,14 @@ def api_saved_records():
             "mode": r.get("mode"),
             "created_at": r.get("created_at"),
             "image_url": r.get("image_url") or r.get("saved_image_url"),
+            "debug_image_url": r.get("debug_image_url"),
             "final_user_status": r.get("final_user_status"),
             "final_user_message": r.get("final_user_message"),
             "final_reason": r.get("final_reason"),
             "best_ref_image_id": r.get("best_ref_image_id"),
             "scores": r.get("scores", {}),
             "client_quality": r.get("client_quality", {}),
+            "server_crop": r.get("server_crop", {}),
         })
     return {"count": len(compact), "records": compact}
 
@@ -904,3 +922,15 @@ def api_record_image(record_id: str):
     if not image_path or not os.path.exists(image_path):
         raise HTTPException(status_code=404, detail="Record image not found.")
     return FileResponse(image_path, media_type="image/jpeg")
+
+
+@app.get("/api/records/{record_id}/debug")
+def api_record_debug_image(record_id: str):
+    path = os.path.join(RECORD_DIR, f"{record_id}.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Record not found.")
+    rec = read_json(path)
+    debug_path = rec.get("debug_image_path")
+    if not debug_path or not os.path.exists(debug_path):
+        raise HTTPException(status_code=404, detail="Record debug image not found.")
+    return FileResponse(debug_path, media_type="image/jpeg")
