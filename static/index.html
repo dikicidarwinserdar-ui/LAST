@@ -2,78 +2,114 @@
 <html lang="tr">
 <head>
   <meta charset="utf-8" />
-  <title>CDP Verify Camera</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CDP Verify Camera</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <main class="app-shell">
-    <section class="header-card">
-      <div>
-        <h1>CDP Verify Camera</h1>
-        <p>Her aşama canlı kamerayla otomatik çekilir. Manuel fotoğraf çekme yoktur.</p>
-      </div>
-      <div class="ref-pill" id="refInfo">Referans kontrol ediliyor...</div>
-    </section>
+  <header class="topbar">
+    <div>
+      <div class="brand">CDP Verify</div>
+      <div class="subbrand">Canlı kamera + otomatik kalite kontrol + manuel kayıt onayı</div>
+    </div>
+    <div class="health" id="healthInfo">Sistem kontrol ediliyor...</div>
+  </header>
 
-    <section class="stage-card">
-      <h2>1. Aşama seç</h2>
-      <div class="stage-grid">
-        <button class="stage-btn" data-mode="reference">
-          <strong>Referans Çek</strong>
-          <span>Netlik yeterliyse otomatik kaydeder</span>
-        </button>
-        <button class="stage-btn" data-mode="original">
-          <strong>Orijinal Çek</strong>
-          <span>Referansa göre skorlar ve kaydeder</span>
-        </button>
-        <button class="stage-btn" data-mode="copy">
-          <strong>Kopya Çek</strong>
-          <span>Kopya testini skorlar ve kaydeder</span>
-        </button>
-        <button class="stage-btn primary" data-mode="test">
-          <strong>Test Et</strong>
-          <span>Doğrulama sonucu verir ve kaydeder</span>
-        </button>
+  <nav class="nav">
+    <button class="nav-btn active" data-page="reference">Referans Yükle</button>
+    <button class="nav-btn" data-page="print">Baskı Yükle</button>
+    <button class="nav-btn" data-page="test">Test Et</button>
+    <button class="nav-btn" data-page="saved">Kayıtlı CDP'lerim</button>
+  </nav>
+
+  <main class="layout">
+    <section class="page active" id="page-reference">
+      <div class="card">
+        <h1>Referans Yükle</h1>
+        <p class="hint">Sistem CDP'yi canlı kamerada algılar, kalite yeterliyse otomatik çeker. Çekimden sonra sadece sen onay verirsen referans olarak kaydeder.</p>
+        <button class="primary start-mode" data-mode="reference">Referans kamera akışını başlat</button>
       </div>
     </section>
 
-    <section class="camera-card">
-      <div class="camera-topline">
-        <h2>2. Kamerayı CDP’ye tut</h2>
-        <div id="modeBadge" class="mode-badge">Mod seçilmedi</div>
-      </div>
-
-      <div class="camera-wrap">
-        <video id="video" autoplay playsinline muted></video>
-        <div class="scan-frame">
-          <div class="corner tl"></div>
-          <div class="corner tr"></div>
-          <div class="corner bl"></div>
-          <div class="corner br"></div>
-          <div class="frame-label">CDP alanını buraya doldur</div>
+    <section class="page" id="page-print">
+      <div class="card">
+        <h1>Baskı Yükle</h1>
+        <p class="hint">Orijinal veya sahte/kopya baskı örneğini canlı kamerayla otomatik çektir. Fotoğraf otomatik çekilir ama kayıt için senin onayın gerekir.</p>
+        <div class="split-actions">
+          <button class="primary start-mode" data-mode="original">Orijinal baskı çek</button>
+          <button class="danger start-mode" data-mode="copy">Sahte / kopya baskı çek</button>
         </div>
-        <div id="readyOverlay" class="ready-overlay">Mod seç</div>
+      </div>
+    </section>
+
+    <section class="page" id="page-test">
+      <div class="card">
+        <h1>Test Et</h1>
+        <p class="hint">Gerçek doğrulama ekranı. Kamera CDP'yi algılar, koşullar yeterli olunca otomatik çeker ve referanslarla karşılaştırır.</p>
+        <button class="primary start-mode" data-mode="test">Test kamerasını başlat</button>
+      </div>
+    </section>
+
+    <section class="page" id="page-saved">
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h1>Kayıtlı CDP'lerim</h1>
+            <p class="hint">Kaydedilmiş referans, orijinal, kopya ve test çekimlerini skorlarıyla birlikte gör.</p>
+          </div>
+          <button class="secondary" id="refreshSavedBtn">Listeyi yenile</button>
+        </div>
+        <div id="savedGrid" class="saved-grid"></div>
+      </div>
+    </section>
+
+    <section class="camera-panel" id="cameraPanel">
+      <div class="camera-head">
+        <div>
+          <div class="mode-title" id="modeTitle">Kamera kapalı</div>
+          <div class="mode-subtitle" id="modeSubtitle">Bir aşama seç.</div>
+        </div>
+        <button class="secondary" id="stopCameraBtn">Kamerayı kapat</button>
       </div>
 
-      <canvas id="analysisCanvas" class="hidden"></canvas>
-      <canvas id="captureCanvas" class="hidden"></canvas>
+      <div class="video-wrap">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlayCanvas"></canvas>
+        <div class="ready-overlay wait" id="readyOverlay">Bekleniyor</div>
+      </div>
 
       <div class="quality-grid">
-        <div class="metric"><span>Netlik</span><b id="focusVal">0</b></div>
-        <div class="metric"><span>Işık</span><b id="brightnessVal">0</b></div>
-        <div class="metric"><span>Kontrast</span><b id="contrastVal">0</b></div>
-        <div class="metric"><span>Hareket</span><b id="motionVal">0</b></div>
+        <div class="metric"><span>Focus</span><b id="focusVal">--</b></div>
+        <div class="metric"><span>Işık</span><b id="brightnessVal">--</b></div>
+        <div class="metric"><span>Kontrast</span><b id="contrastVal">--</b></div>
+        <div class="metric"><span>Hareket</span><b id="motionVal">--</b></div>
+        <div class="metric"><span>CDP Box</span><b id="boxVal">--</b></div>
       </div>
 
-      <div id="qualityMessage" class="quality-message">Aşama seçince kamera açılacak.</div>
-      <div id="autoState" class="auto-state">Otomatik çekim bekliyor.</div>
+      <div class="quality-message" id="qualityMessage">CDP'yi kare içine al.</div>
+      <div class="auto-state" id="autoState">Manuel çekim yok. Koşullar uygun olunca sistem otomatik çeker.</div>
+
+      <canvas id="analysisCanvas" hidden></canvas>
+      <canvas id="captureCanvas" hidden></canvas>
     </section>
 
-    <section class="result-card">
-      <h2>3. Sonuç</h2>
-      <div id="statusBox" class="status-box empty">Henüz sonuç yok.</div>
-      <pre id="resultBox" class="result-json"></pre>
+    <section class="pending-panel" id="pendingPanel">
+      <div class="card">
+        <h2>Otomatik çekim alındı</h2>
+        <p class="hint">Fotoğraf henüz kalıcı kaydedilmedi. Kontrol edip kaydet veya tekrar çek.</p>
+        <div class="pending-layout">
+          <img id="pendingImage" class="pending-image" alt="Pending capture" />
+          <div class="pending-info">
+            <div id="pendingStatus" class="status-box empty">Sonuç bekleniyor...</div>
+            <div class="pending-actions">
+              <button class="primary" id="savePendingBtn">Kaydet</button>
+              <button class="secondary" id="retakeBtn">Tekrar çek</button>
+              <button class="secondary" id="discardBtn">Vazgeç</button>
+            </div>
+            <pre id="resultBox" class="result-box"></pre>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 
