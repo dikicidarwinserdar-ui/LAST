@@ -1,21 +1,22 @@
 const QUALITY = {
-  minFocus: 58,
-  minBrightness: 55,
-  maxBrightness: 205,
-  minContrast: 28,
-  maxMotion: 5.5,
-  stableMs: 950,
-  cooldownMs: 1400,
+  minFocus: 46,
+  minBrightness: 50,
+  maxBrightness: 212,
+  minContrast: 23,
+  maxMotion: 8.2,
+  stableMs: 650,
+  cooldownMs: 1300,
   analysisWidth: 360,
   jpegQuality: 0.96,
-  minBoxCoverage: 0.18,
-  maxBoxCoverage: 0.82,
-  maxCenterError: 0.19,
-  minAspect: 0.72,
-  maxAspect: 1.38,
-  minInkFill: 0.035,
-  maxInkFill: 0.72,
-  minBoxStability: 0.86
+
+  minBoxCoverage: 0.10,
+  maxBoxCoverage: 0.92,
+  maxCenterError: 0.29,
+  minAspect: 0.62,
+  maxAspect: 1.55,
+  minInkFill: 0.020,
+  maxInkFill: 0.78,
+  minBoxStability: 0.58
 };
 
 const MODE_LABELS = {
@@ -41,19 +42,24 @@ const pendingPanel = document.getElementById("pendingPanel");
 const modeTitle = document.getElementById("modeTitle");
 const modeSubtitle = document.getElementById("modeSubtitle");
 const readyOverlay = document.getElementById("readyOverlay");
+
 const focusVal = document.getElementById("focusVal");
 const brightnessVal = document.getElementById("brightnessVal");
 const contrastVal = document.getElementById("contrastVal");
 const motionVal = document.getElementById("motionVal");
 const boxVal = document.getElementById("boxVal");
+
 const qualityMessage = document.getElementById("qualityMessage");
 const autoState = document.getElementById("autoState");
+
 const pendingImage = document.getElementById("pendingImage");
 const pendingStatus = document.getElementById("pendingStatus");
 const resultBox = document.getElementById("resultBox");
+
 const savePendingBtn = document.getElementById("savePendingBtn");
 const retakeBtn = document.getElementById("retakeBtn");
 const discardBtn = document.getElementById("discardBtn");
+
 const refreshSavedBtn = document.getElementById("refreshSavedBtn");
 const savedGrid = document.getElementById("savedGrid");
 const healthInfo = document.getElementById("healthInfo");
@@ -74,28 +80,39 @@ let lastCaptureAt = 0;
 let lastMetrics = null;
 let pendingData = null;
 
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
+
 
 function round2(v) {
   if (typeof v !== "number" || !isFinite(v)) return 0;
   return Math.round(v * 100) / 100;
 }
 
+
 function setOverlay(text, cls) {
+  if (!readyOverlay) return;
   readyOverlay.textContent = text;
   readyOverlay.className = `ready-overlay ${cls || ""}`.trim();
 }
 
+
 function showPage(pageName) {
-  navButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.page === pageName));
-  pages.forEach(page => page.classList.toggle("active", page.id === `page-${pageName}`));
+  navButtons.forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.page === pageName);
+  });
+
+  pages.forEach(page => {
+    page.classList.toggle("active", page.id === `page-${pageName}`);
+  });
 
   if (pageName === "saved") {
     loadSavedRecords();
   }
 }
+
 
 function stopCamera() {
   if (rafId) {
@@ -112,6 +129,7 @@ function stopCamera() {
   previousBox = null;
   readySince = null;
 }
+
 
 function setStatusBox(el, data) {
   let cls = "review";
@@ -137,31 +155,28 @@ function setStatusBox(el, data) {
   el.innerHTML = `${status}<br>${data.final_user_message || ""}`;
 }
 
+
 function setError(message) {
   pendingStatus.className = "status-box bad";
   pendingStatus.textContent = message;
   resultBox.textContent = message;
 }
 
+
 async function loadHealth() {
   try {
     const res = await fetch("/health");
     const data = await res.json();
-    healthInfo.textContent = `Referans: ${data.reference_count} | Kayıt: ${data.records}`;
+
+    const refCount = data.reference_count ?? 0;
+    const records = data.records ?? 0;
+
+    healthInfo.textContent = `Referans: ${refCount} | Kayıt: ${records}`;
   } catch (err) {
     healthInfo.textContent = "Sistem kontrol edilemedi";
   }
 }
 
-async function loadRefs() {
-  try {
-    const res = await fetch("/api/refs");
-    const data = await res.json();
-    healthInfo.textContent = `Referans: ${data.reference_count}`;
-  } catch (err) {
-    healthInfo.textContent = "Referans: 0";
-  }
-}
 
 async function startCamera(mode) {
   currentMode = mode;
@@ -180,8 +195,8 @@ async function startCamera(mode) {
   modeTitle.textContent = MODE_LABELS[mode] || mode;
   modeSubtitle.textContent = MODE_SUBTITLES[mode] || "";
 
-  autoState.textContent = "Kamera açılıyor. Manuel çekim yok; sistem sadece uygun koşulda otomatik çeker.";
-  qualityMessage.textContent = "CDP'yi kameraya göster. Sistem CDP kutusunu bulunca kare içine alacak.";
+  autoState.textContent = "Kamera açılıyor. Manuel çekim yok; sistem uygun koşulda otomatik çeker.";
+  qualityMessage.textContent = "CDP'yi kameraya göster. Sistem CDP alanını canlıda kutu içine almaya çalışacak.";
   setOverlay("Kamera açılıyor", "wait");
 
   try {
@@ -197,7 +212,7 @@ async function startCamera(mode) {
     video.srcObject = stream;
     await video.play();
 
-    autoState.textContent = "CDP algılanıyor. Netlik, ışık, hareket ve kutu stabilitesi yeterliyse otomatik çekilecek.";
+    autoState.textContent = "CDP aranıyor. Sarı kutu aday alanı, yeşil kutu çekime hazır alanı gösterir.";
     rafId = requestAnimationFrame(analyzeLoop);
   } catch (err) {
     setOverlay("Kamera açılamadı", "bad");
@@ -205,8 +220,9 @@ async function startCamera(mode) {
   }
 }
 
+
 function detectCdpBox(gray, aw, ah, mean, contrast) {
-  const threshold = Math.min(125, mean - contrast * 0.35);
+  const threshold = Math.min(145, Math.max(55, mean - contrast * 0.22));
 
   let minX = aw;
   let minY = ah;
@@ -214,8 +230,8 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
   let maxY = 0;
   let blackCount = 0;
 
-  const marginX = Math.floor(aw * 0.04);
-  const marginY = Math.floor(ah * 0.04);
+  const marginX = Math.floor(aw * 0.035);
+  const marginY = Math.floor(ah * 0.035);
 
   for (let y = marginY; y < ah - marginY; y++) {
     for (let x = marginX; x < aw - marginX; x++) {
@@ -233,19 +249,21 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
     }
   }
 
-  if (blackCount < aw * ah * 0.01) {
+  if (blackCount < aw * ah * 0.006) {
     return {
       found: false,
+      candidate: false,
       score: 0,
       reason: "cdp_yok",
-      box: null
+      box: null,
+      checks: {}
     };
   }
 
   const w = maxX - minX + 1;
   const h = maxY - minY + 1;
   const area = w * h;
-  const coverage = area / (aw * ah);
+  const coverage = area / Math.max(1, aw * ah);
   const aspect = w / Math.max(1, h);
 
   const centerX = (minX + maxX) / 2;
@@ -267,7 +285,7 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
     const dh = Math.abs(h - previousBox.h) / ah;
 
     const movement = dx + dy + dw + dh;
-    boxStability = clamp(1 - movement * 6, 0, 1);
+    boxStability = clamp(1 - movement * 4.2, 0, 1);
   }
 
   const passCoverage = coverage >= QUALITY.minBoxCoverage && coverage <= QUALITY.maxBoxCoverage;
@@ -277,11 +295,23 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
   const passStability = boxStability >= QUALITY.minBoxStability;
 
   let score = 0;
-  score += passCoverage ? 24 : 0;
-  score += passAspect ? 22 : 0;
-  score += passCenter ? 22 : 0;
-  score += passInk ? 16 : 0;
-  score += passStability ? 16 : 0;
+  score += passCoverage ? 24 : Math.max(0, 24 - Math.abs(coverage - 0.45) * 55);
+  score += passAspect ? 22 : Math.max(0, 22 - Math.abs(aspect - 1.0) * 22);
+  score += passCenter ? 22 : Math.max(0, 22 - centerError * 55);
+  score += passInk ? 16 : Math.max(0, 16 - Math.abs(inkFill - 0.20) * 40);
+  score += passStability ? 16 : Math.max(0, boxStability * 16);
+
+  score = clamp(score, 0, 100);
+
+  const candidate =
+    coverage >= 0.055 &&
+    coverage <= 0.96 &&
+    aspect >= 0.48 &&
+    aspect <= 1.95 &&
+    inkFill >= 0.010 &&
+    inkFill <= 0.88;
+
+  const found = passCoverage && passAspect && passCenter && passInk && passStability;
 
   previousBox = {
     minX,
@@ -295,9 +325,10 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
   };
 
   return {
-    found: passCoverage && passAspect && passCenter && passInk && passStability,
+    found,
+    candidate,
     score,
-    reason: "ok",
+    reason: found ? "ok" : "candidate",
     box: {
       minX,
       minY,
@@ -320,6 +351,7 @@ function detectCdpBox(gray, aw, ah, mean, contrast) {
     }
   };
 }
+
 
 function computeMetrics() {
   if (!video.videoWidth || !video.videoHeight) return null;
@@ -385,7 +417,7 @@ function computeMetrics() {
 
   const lapMean = lapSum / Math.max(1, count);
   const lapVar = lapSqSum / Math.max(1, count) - lapMean * lapMean;
-  const focusScore = clamp((lapVar - 25) / 135 * 100, 0, 100);
+  const focusScore = clamp((lapVar - 22) / 125 * 100, 0, 100);
 
   let motion = 0;
 
@@ -431,7 +463,10 @@ function computeMetrics() {
   };
 }
 
+
 function drawOverlay(metrics) {
+  if (!overlayCanvas || !video) return;
+
   const rect = video.getBoundingClientRect();
 
   overlayCanvas.width = rect.width;
@@ -443,19 +478,25 @@ function drawOverlay(metrics) {
   const cw = overlayCanvas.width;
   const ch = overlayCanvas.height;
 
-  const guideSize = Math.min(cw, ch) * 0.62;
+  const guideSize = Math.min(cw, ch) * 0.66;
   const gx = (cw - guideSize) / 2;
   const gy = (ch - guideSize) / 2;
 
-  ctx.strokeStyle = "rgba(96, 165, 250, 0.75)";
-  ctx.lineWidth = 3;
-  ctx.setLineDash([10, 8]);
+  ctx.save();
+
+  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+  ctx.fillRect(0, 0, cw, ch);
+  ctx.clearRect(gx, gy, guideSize, guideSize);
+
+  ctx.strokeStyle = "rgba(59, 130, 246, 0.95)";
+  ctx.lineWidth = 4;
+  ctx.setLineDash([14, 8]);
   ctx.strokeRect(gx, gy, guideSize, guideSize);
   ctx.setLineDash([]);
 
-  ctx.fillStyle = "rgba(96, 165, 250, 0.95)";
+  ctx.fillStyle = "rgba(59, 130, 246, 0.98)";
   ctx.font = "bold 15px Arial";
-  ctx.fillText("CDP alanını bu kareye sığdır", gx + 10, gy + 24);
+  ctx.fillText("CDP alanını bu kareye sığdır", gx + 12, gy + 26);
 
   if (metrics && metrics.cdp && metrics.cdp.box) {
     const b = metrics.cdp.box;
@@ -468,25 +509,41 @@ function drawOverlay(metrics) {
     const w = b.w * sx;
     const h = b.h * sy;
 
-    ctx.strokeStyle = metrics.cdp.found
-      ? "rgba(34, 197, 94, 0.95)"
-      : "rgba(251, 191, 36, 0.95)";
+    const color = metrics.cdp.found
+      ? "rgba(34, 197, 94, 1)"
+      : "rgba(251, 191, 36, 1)";
 
-    ctx.lineWidth = 4;
+    const fillColor = metrics.cdp.found
+      ? "rgba(34, 197, 94, 0.16)"
+      : "rgba(251, 191, 36, 0.16)";
+
+    ctx.fillStyle = fillColor;
+    ctx.fillRect(x, y, w, h);
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 5;
+    ctx.setLineDash([]);
     ctx.strokeRect(x, y, w, h);
 
-    ctx.fillStyle = metrics.cdp.found
-      ? "rgba(34, 197, 94, 0.95)"
-      : "rgba(251, 191, 36, 0.95)";
-
+    ctx.fillStyle = color;
     ctx.font = "bold 16px Arial";
     ctx.fillText(
-      metrics.cdp.found ? "CDP ALGILANDI" : "CDP KUTUSU AYARLANIYOR",
+      metrics.cdp.found ? "CDP ALGILANDI - HAZIR" : "CDP ADAYI - AYARLA",
       x + 8,
-      Math.max(24, y - 8)
+      Math.max(24, y - 10)
+    );
+
+    ctx.font = "13px Arial";
+    ctx.fillText(
+      `Box ${Math.round(metrics.cdp.score)} | Alan ${(b.coverage * 100).toFixed(0)}% | Oran ${b.aspect.toFixed(2)}`,
+      x + 8,
+      Math.min(ch - 12, y + h + 20)
     );
   }
+
+  ctx.restore();
 }
+
 
 function updateQualityUI(metrics) {
   focusVal.textContent = Math.round(metrics.focusScore);
@@ -498,7 +555,11 @@ function updateQualityUI(metrics) {
   const issues = [];
 
   if (!metrics.passCdp) {
-    issues.push("CDP kutusunu merkeze al ve kareye sığdır");
+    if (metrics.cdp && metrics.cdp.candidate) {
+      issues.push("sarı kutuyu merkeze al, biraz sabit tut");
+    } else {
+      issues.push("CDP alanını kare içine al");
+    }
   }
 
   if (!metrics.passFocus) {
@@ -510,7 +571,7 @@ function updateQualityUI(metrics) {
   }
 
   if (!metrics.passContrast) {
-    issues.push("kontrast düşük, CDP alanını daha iyi kadraja al");
+    issues.push("kontrast düşük");
   }
 
   if (!metrics.passMotion) {
@@ -518,11 +579,12 @@ function updateQualityUI(metrics) {
   }
 
   if (issues.length === 0) {
-    qualityMessage.textContent = "Koşullar uygun. CDP kutusu stabil kalırsa otomatik çekilecek.";
+    qualityMessage.textContent = "Koşullar uygun. Yeşil kutu stabil kalırsa otomatik çekilecek.";
   } else {
     qualityMessage.textContent = "Bekleniyor: " + issues.join(", ") + ".";
   }
 }
+
 
 function analyzeLoop(timestamp) {
   if (!currentMode || isUploading) {
@@ -561,7 +623,7 @@ function analyzeLoop(timestamp) {
       }
     } else {
       setOverlay(`Hazır — ${Math.ceil(remaining / 100) / 10}s sabit tut`, "ready");
-      autoState.textContent = "CDP bulundu. Sistem daha güvenli çekim için stabil süre bekliyor.";
+      autoState.textContent = "CDP bulundu. Sistem güvenli çekim için kısa stabil süre bekliyor.";
     }
   } else {
     readySince = null;
@@ -571,6 +633,7 @@ function analyzeLoop(timestamp) {
 
   rafId = requestAnimationFrame(analyzeLoop);
 }
+
 
 async function captureAndPreview() {
   if (!currentMode || isUploading) return;
@@ -638,6 +701,7 @@ async function captureAndPreview() {
   }
 }
 
+
 function buildQualityPayload() {
   if (!lastMetrics) return {};
 
@@ -662,6 +726,7 @@ function buildQualityPayload() {
     thresholds: QUALITY
   };
 }
+
 
 async function savePending() {
   if (!pendingData || !pendingData.capture_id) return;
@@ -696,6 +761,7 @@ async function savePending() {
   }
 }
 
+
 async function discardPending() {
   if (pendingData && pendingData.capture_id) {
     try {
@@ -709,6 +775,7 @@ async function discardPending() {
   pendingPanel.classList.remove("active");
 }
 
+
 async function retakeCurrentMode() {
   const mode = currentMode || (pendingData && pendingData.mode);
 
@@ -719,20 +786,24 @@ async function retakeCurrentMode() {
   }
 }
 
+
 function formatDate(ts) {
   if (!ts) return "-";
   return new Date(ts * 1000).toLocaleString("tr-TR");
 }
 
+
 function modeName(mode) {
   return MODE_LABELS[mode] || mode;
 }
+
 
 function scoreLine(label, value) {
   if (value === undefined || value === null || value === "") return "";
 
   return `<div class="score-line"><span>${label}</span><b>${value}</b></div>`;
 }
+
 
 async function loadSavedRecords() {
   savedGrid.innerHTML = "<div class='hint'>Kayıtlar yükleniyor...</div>";
@@ -790,18 +861,24 @@ async function loadSavedRecords() {
   }
 }
 
+
 navButtons.forEach(btn => {
   btn.addEventListener("click", () => showPage(btn.dataset.page));
 });
+
 
 startModeButtons.forEach(btn => {
   btn.addEventListener("click", () => startCamera(btn.dataset.mode));
 });
 
-stopCameraBtn.addEventListener("click", () => {
-  stopCamera();
-  cameraPanel.classList.remove("active");
-});
+
+if (stopCameraBtn) {
+  stopCameraBtn.addEventListener("click", () => {
+    stopCamera();
+    cameraPanel.classList.remove("active");
+  });
+}
+
 
 savePendingBtn.addEventListener("click", savePending);
 retakeBtn.addEventListener("click", retakeCurrentMode);
