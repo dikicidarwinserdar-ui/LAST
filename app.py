@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 APP_TITLE = "CDP Verify Camera Render"
-APP_VERSION = "4.0.0-server-live-detect"
+APP_VERSION = "5.0.0-calibrated-quality-gate"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -35,6 +35,60 @@ NORMALIZED_SIZE = 1200
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VALID_MODES = {"reference", "original", "copy", "test"}
+
+
+# ============================================================
+# CAMERA QUALITY CONFIG — calibrated from existing 38 Colab images
+# Source analysis: /content/drive/MyDrive/cdp/_outputs/camera_overlay_threshold_analysis
+# Logic:
+# - ACCEPT => frontend may auto-capture after stable frames
+# - REVIEW => show guidance, do not capture yet
+# - REJECT => no capture; image quality/geometry is outside safe range
+# ============================================================
+
+CAMERA_QUALITY_CONFIG = {
+    "accept": {
+        "marker_count_min": 12,
+        "white_position_required": "bottom_4",
+        "mean_reproj_error_max": 1.75,
+        "max_reproj_error_max": 5.00,
+        "marker_size_cv_max": 0.12,
+        "blur_score_min": 200.0,
+        "cdp_black_ratio_min": 0.25,
+        "cdp_black_ratio_max": 0.40,
+        "raw_brightness_min": 135.0,
+        "raw_brightness_max": 155.0,
+        "raw_contrast_min": 37.0,
+        "raw_glare_ratio_max": 0.003,
+        "raw_dark_ratio_max": 0.04,
+        "raw_shadow_score_max": 0.36,
+        "raw_aspect_min": 1.35,
+        "raw_aspect_max": 1.60,
+    },
+    "review": {
+        "marker_count_min": 12,
+        "white_position_required": "bottom_4",
+        "mean_reproj_error_max": 6.0,
+        "max_reproj_error_max": 14.0,
+        "marker_size_cv_max": 0.18,
+        "blur_score_min": 120.0,
+        "cdp_black_ratio_min": 0.20,
+        "cdp_black_ratio_max": 0.45,
+        "raw_brightness_min": 120.0,
+        "raw_brightness_max": 175.0,
+        "raw_contrast_min": 30.0,
+        "raw_glare_ratio_max": 0.02,
+        "raw_dark_ratio_max": 0.10,
+        "raw_shadow_score_max": 0.45,
+        "raw_aspect_min": 1.15,
+        "raw_aspect_max": 1.85,
+    },
+    "auto_capture": {
+        "stable_accept_frames": 3,
+        "min_quality_gate_score": 82,
+        "review_quality_gate_score": 65,
+    },
+}
 
 REFERENCE_CACHE: List[Dict[str, Any]] = []
 
@@ -218,6 +272,192 @@ def warp_quad_to_square(img: np.ndarray, quad: np.ndarray, size: int = NORMALIZE
     warped = cv2.warpPerspective(img, m, (size, size), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return warped
 
+
+
+# ============================================================
+# CALIBRATED CAMERA QUALITY HELPERS
+# ============================================================
+
+def compute_raw_image_metrics_for_gate(img_bgr: np.ndarray) -> Dict[str, float]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    blur_laplacian = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    tenengrad = float(np.mean(gx * gx + gy * gy))
+    glare_ratio = float(np.mean(gray >= 245))
+    dark_ratio = float(np.mean(gray <= 35))
+    bg = cv2.GaussianBlur(gray, (0, 0), 45)
+    bg_mean = float(np.mean(bg))
+    bg_std = float(np.std(bg))
+    shadow_score = float(bg_std / max(bg_mean, 1.0))
+    return {
+        "raw_brightness": brightness,
+        "raw_contrast": contrast,
+        "raw_blur_laplacian": blur_laplacian,
+        "raw_tenengrad": tenengrad,
+        "raw_glare_ratio": glare_ratio,
+        "raw_dark_ratio": dark_ratio,
+        "raw_shadow_score": shadow_score,
+    }
+
+
+def make_black_mask_for_gate(img_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    bg = cv2.GaussianBlur(gray, (0, 0), 45)
+    norm = cv2.divide(gray, bg, scale=255)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    norm = clahe.apply(norm)
+    _, black_mask = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return gray, norm, black_mask
+
+
+def compute_crop_quality_metrics_for_gate(crop_bgr: np.ndarray) -> Dict[str, float]:
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    _, _, black_mask = make_black_mask_for_gate(crop_bgr)
+    cdp_black_ratio = float(np.mean(black_mask > 0))
+    crop_brightness = float(np.mean(gray))
+    crop_contrast = float(np.std(gray))
+    return {
+        "blur_score": blur_score,
+        "cdp_black_ratio": cdp_black_ratio,
+        "crop_brightness": crop_brightness,
+        "crop_contrast": crop_contrast,
+    }
+
+
+def gate_score_higher_is_better(value: float, accept_min: float, review_min: float) -> float:
+    value = safe_float(value, 0.0)
+    if value >= accept_min:
+        return 100.0
+    if value <= review_min:
+        return 0.0
+    return 100.0 * (value - review_min) / max(accept_min - review_min, 1e-9)
+
+
+def gate_score_lower_is_better(value: float, accept_max: float, review_max: float) -> float:
+    value = safe_float(value, review_max)
+    if value <= accept_max:
+        return 100.0
+    if value >= review_max:
+        return 0.0
+    return 100.0 * (review_max - value) / max(review_max - accept_max, 1e-9)
+
+
+def gate_score_range_is_better(value: float, accept_min: float, accept_max: float, review_min: float, review_max: float) -> float:
+    value = safe_float(value, 0.0)
+    if accept_min <= value <= accept_max:
+        return 100.0
+    if value < review_min or value > review_max:
+        return 0.0
+    if value < accept_min:
+        return 100.0 * (value - review_min) / max(accept_min - review_min, 1e-9)
+    return 100.0 * (review_max - value) / max(review_max - accept_max, 1e-9)
+
+
+def compute_quality_gate_score(metrics: Dict[str, Any]) -> float:
+    a = CAMERA_QUALITY_CONFIG["accept"]
+    r = CAMERA_QUALITY_CONFIG["review"]
+    score = (
+        0.20 * gate_score_higher_is_better(metrics.get("blur_score"), a["blur_score_min"], r["blur_score_min"]) +
+        0.12 * gate_score_range_is_better(metrics.get("raw_brightness"), a["raw_brightness_min"], a["raw_brightness_max"], r["raw_brightness_min"], r["raw_brightness_max"]) +
+        0.08 * gate_score_higher_is_better(metrics.get("raw_contrast"), a["raw_contrast_min"], r["raw_contrast_min"]) +
+        0.16 * gate_score_lower_is_better(metrics.get("mean_reproj_error"), a["mean_reproj_error_max"], r["mean_reproj_error_max"]) +
+        0.10 * gate_score_lower_is_better(metrics.get("max_reproj_error"), a["max_reproj_error_max"], r["max_reproj_error_max"]) +
+        0.10 * gate_score_lower_is_better(metrics.get("marker_size_cv"), a["marker_size_cv_max"], r["marker_size_cv_max"]) +
+        0.12 * gate_score_range_is_better(metrics.get("cdp_black_ratio"), a["cdp_black_ratio_min"], a["cdp_black_ratio_max"], r["cdp_black_ratio_min"], r["cdp_black_ratio_max"]) +
+        0.04 * gate_score_lower_is_better(metrics.get("raw_glare_ratio"), a["raw_glare_ratio_max"], r["raw_glare_ratio_max"]) +
+        0.04 * gate_score_lower_is_better(metrics.get("raw_shadow_score"), a["raw_shadow_score_max"], r["raw_shadow_score_max"]) +
+        0.04 * (100.0 if int(metrics.get("marker_count", 0) or 0) >= a["marker_count_min"] else 0.0)
+    )
+    return round(float(score), 3)
+
+
+def camera_quality_decision(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    a = CAMERA_QUALITY_CONFIG["accept"]
+    r = CAMERA_QUALITY_CONFIG["review"]
+    hard = []
+
+    if int(metrics.get("marker_count", 0) or 0) < r["marker_count_min"]:
+        hard.append("marker_count_low")
+    if safe_float(metrics.get("mean_reproj_error"), 999.0) > r["mean_reproj_error_max"]:
+        hard.append("mean_reproj_too_high")
+    if safe_float(metrics.get("max_reproj_error"), 999.0) > r["max_reproj_error_max"]:
+        hard.append("max_reproj_too_high")
+    if safe_float(metrics.get("marker_size_cv"), 999.0) > r["marker_size_cv_max"]:
+        hard.append("marker_size_cv_too_high")
+    if safe_float(metrics.get("blur_score"), 0.0) < r["blur_score_min"]:
+        hard.append("blur_too_low")
+    cbr = safe_float(metrics.get("cdp_black_ratio"), -1.0)
+    if not (r["cdp_black_ratio_min"] <= cbr <= r["cdp_black_ratio_max"]):
+        hard.append("cdp_black_ratio_out_of_range")
+    if not (r["raw_brightness_min"] <= safe_float(metrics.get("raw_brightness"), 0.0) <= r["raw_brightness_max"]):
+        hard.append("brightness_out_of_range")
+    if safe_float(metrics.get("raw_contrast"), 0.0) < r["raw_contrast_min"]:
+        hard.append("contrast_too_low")
+    if safe_float(metrics.get("raw_shadow_score"), 999.0) > r["raw_shadow_score_max"]:
+        hard.append("shadow_too_high")
+    if safe_float(metrics.get("raw_glare_ratio"), 999.0) > r["raw_glare_ratio_max"]:
+        hard.append("glare_too_high")
+
+    gate_score = compute_quality_gate_score(metrics)
+
+    if hard:
+        return {"status": "REJECT", "ready": False, "quality_gate_score": gate_score, "reasons": hard}
+
+    review_reasons = []
+    if safe_float(metrics.get("mean_reproj_error"), 999.0) > a["mean_reproj_error_max"]:
+        review_reasons.append("mean_reproj_review")
+    if safe_float(metrics.get("max_reproj_error"), 999.0) > a["max_reproj_error_max"]:
+        review_reasons.append("max_reproj_review")
+    if safe_float(metrics.get("marker_size_cv"), 999.0) > a["marker_size_cv_max"]:
+        review_reasons.append("marker_size_cv_review")
+    if safe_float(metrics.get("blur_score"), 0.0) < a["blur_score_min"]:
+        review_reasons.append("focus_review")
+    if not (a["cdp_black_ratio_min"] <= cbr <= a["cdp_black_ratio_max"]):
+        review_reasons.append("cdp_black_ratio_review")
+    if not (a["raw_brightness_min"] <= safe_float(metrics.get("raw_brightness"), 0.0) <= a["raw_brightness_max"]):
+        review_reasons.append("brightness_review")
+    if safe_float(metrics.get("raw_contrast"), 0.0) < a["raw_contrast_min"]:
+        review_reasons.append("contrast_review")
+    if safe_float(metrics.get("raw_shadow_score"), 999.0) > a["raw_shadow_score_max"]:
+        review_reasons.append("shadow_review")
+    if safe_float(metrics.get("raw_glare_ratio"), 999.0) > a["raw_glare_ratio_max"]:
+        review_reasons.append("glare_review")
+
+    if review_reasons:
+        return {"status": "REVIEW", "ready": False, "quality_gate_score": gate_score, "reasons": review_reasons}
+
+    return {"status": "ACCEPT", "ready": True, "quality_gate_score": gate_score, "reasons": ["OK"]}
+
+
+def user_message_from_gate(decision: Dict[str, Any]) -> str:
+    status = decision.get("status")
+    reasons = decision.get("reasons", [])
+    if status == "ACCEPT":
+        return "CDP/marker alanı yakalandı. Kalite uygun; otomatik çekim yapılabilir."
+    mapping = {
+        "marker_count_low": "marker/CDP alanı tam yakalanmadı",
+        "mean_reproj_too_high": "açı/perspektif çok bozuk",
+        "max_reproj_too_high": "marker hizalaması bozuk",
+        "marker_size_cv_too_high": "marker boyutları tutarsız",
+        "blur_too_low": "netlik düşük",
+        "focus_review": "netlik biraz daha iyi olmalı",
+        "cdp_black_ratio_out_of_range": "CDP siyah yoğunluğu beklenen aralıkta değil",
+        "cdp_black_ratio_review": "CDP yoğunluğu sınırda",
+        "brightness_out_of_range": "ışık seviyesi uygun değil",
+        "brightness_review": "ışık seviyesi sınırda",
+        "contrast_too_low": "kontrast düşük",
+        "contrast_review": "kontrast sınırda",
+        "shadow_too_high": "gölge fazla",
+        "shadow_review": "gölge sınırda",
+        "glare_too_high": "parlama fazla",
+        "glare_review": "parlama sınırda",
+    }
+    readable = [mapping.get(r, r) for r in reasons]
+    return "Bekleniyor: " + ", ".join(readable) + "."
 
 def make_debug_image(img: np.ndarray, quad: Optional[np.ndarray], info: Dict[str, Any], mask_small: Optional[np.ndarray] = None) -> np.ndarray:
     debug = img.copy()
@@ -709,11 +949,16 @@ def api_reload_refs():
 
 @app.post("/api/live-detect")
 async def live_detect(file: UploadFile = File(...)):
-    """Fast low-res live detector. Frontend uses this ONLY for guidance/autocapture.
-    Final crop/scoring still happens in /api/preview with full-resolution frame.
+    """Calibrated live detector.
+
+    Frontend sends low/mid-res live frames here. This endpoint uses the
+    same backend crop/quality gate philosophy as the Colab pipeline and
+    returns ACCEPT / REVIEW / REJECT. The frontend only draws the returned
+    polygon and waits for ACCEPT over stable frames.
     """
     if not is_image_file(file.filename or "frame.jpg"):
         raise HTTPException(status_code=400, detail="Unsupported image format")
+
     data = await file.read()
     try:
         img = read_image_from_bytes(data)
@@ -721,20 +966,18 @@ async def live_detect(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
     h, w = img.shape[:2]
-    quad, info, _mask = detect_marker_outer_quad(img)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    brightness = float(np.mean(gray))
-    contrast = float(np.std(gray))
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    focus = float(lap.var())
+    raw_metrics = compute_raw_image_metrics_for_gate(img)
+    quad, detect_info, _mask = detect_marker_outer_quad(img)
 
-    found = quad is not None and safe_float(info.get("confidence")) >= 0.38
+    found = quad is not None and safe_float(detect_info.get("confidence"), 0.0) >= 0.38
+
     ordered_quad = order_points_clockwise(quad).tolist() if quad is not None else None
     bbox = None
-    center_error = 1.0
     coverage = 0.0
-    aspect = 0.0
+    raw_aspect = 0.0
+    center_error = 1.0
+
     if quad is not None:
         xs = quad[:, 0]
         ys = quad[:, 1]
@@ -744,39 +987,87 @@ async def live_detect(file: UploadFile = File(...)):
         bh = max(1.0, y2 - y1)
         bbox = {"x": x1, "y": y1, "w": bw, "h": bh}
         coverage = float((bw * bh) / max(1.0, w * h))
-        aspect = float(bw / bh)
+        raw_aspect = float(bw / bh)
         cx, cy = x1 + bw / 2.0, y1 + bh / 2.0
         center_error = float(math.sqrt(((cx - w / 2) / w) ** 2 + ((cy - h / 2) / h) ** 2))
 
-    # Capture gate: do not force user to fill screen; require usable geometry + focus + light.
-    pass_focus = focus >= 70.0
-    pass_brightness = 38.0 <= brightness <= 232.0
-    pass_contrast = contrast >= 16.0
-    pass_geometry = bool(found and coverage >= 0.012 and coverage <= 0.86 and center_error <= 0.48)
-    ready = bool(pass_focus and pass_brightness and pass_contrast and pass_geometry)
+    crop_quality = {}
+    crop_error = ""
+
+    if found:
+        try:
+            normalized_img, _debug_img, crop_info = normalize_cdp_from_full_frame(img)
+            crop_quality = compute_crop_quality_metrics_for_gate(normalized_img)
+        except Exception as e:
+            crop_info = dict(detect_info)
+            crop_error = str(e)
+    else:
+        crop_info = dict(detect_info)
+        crop_error = "marker_not_found"
+
+    # Existing Render detector is a live proxy; when exact 12-marker Colab
+    # homography fields are unavailable, we use calibrated proxy values.
+    confidence = safe_float(detect_info.get("confidence"), 0.0)
+    marker_count = int(detect_info.get("marker_count", 0) or 0)
+
+    metrics = {
+        **raw_metrics,
+        **crop_quality,
+        "marker_count": marker_count,
+        "white_position": "bottom_4" if found else "NONE",
+        "mean_reproj_error": float(max(0.0, (1.0 - confidence) * 3.0)),
+        "max_reproj_error": float(max(0.0, (1.0 - confidence) * 8.0)),
+        "marker_size_cv": float(max(0.06, min(0.18, 0.18 - confidence * 0.10))),
+        "raw_aspect": raw_aspect,
+        "coverage": coverage,
+        "center_error": center_error,
+    }
+
+    if not found:
+        decision = {"status": "REJECT", "ready": False, "quality_gate_score": 0.0, "reasons": ["marker_count_low"]}
+    else:
+        decision = camera_quality_decision(metrics)
+
+    ready = bool(decision.get("ready"))
+
+    checks = {
+        "marker": bool(found),
+        "quality_gate": decision.get("status"),
+        "brightness": CAMERA_QUALITY_CONFIG["review"]["raw_brightness_min"] <= raw_metrics["raw_brightness"] <= CAMERA_QUALITY_CONFIG["review"]["raw_brightness_max"],
+        "contrast": raw_metrics["raw_contrast"] >= CAMERA_QUALITY_CONFIG["review"]["raw_contrast_min"],
+        "focus": safe_float(metrics.get("blur_score"), 0.0) >= CAMERA_QUALITY_CONFIG["review"]["blur_score_min"],
+        "geometry": bool(found),
+    }
 
     guide = {
         "ready": ready,
         "found": bool(found),
         "quad": ordered_quad,
         "bbox": bbox,
-        "method": info.get("method"),
-        "confidence": safe_float(info.get("confidence")),
-        "marker_count": int(info.get("marker_count", 0) or 0),
+        "method": detect_info.get("method"),
+        "confidence": confidence,
+        "marker_count": marker_count,
         "coverage": coverage,
-        "aspect": aspect,
+        "aspect": raw_aspect,
         "center_error": center_error,
-        "focus": focus,
-        "brightness": brightness,
-        "contrast": contrast,
-        "checks": {
-            "focus": pass_focus,
-            "brightness": pass_brightness,
-            "contrast": pass_contrast,
-            "geometry": pass_geometry,
-        },
-        "message": "CDP yakalandı, sabit tut." if ready else "CDP/marker alanını gölge yapmadan göster. Sistem backend'de yakalayacak.",
+        "focus": safe_float(metrics.get("blur_score"), 0.0),
+        "raw_focus": raw_metrics["raw_blur_laplacian"],
+        "brightness": raw_metrics["raw_brightness"],
+        "contrast": raw_metrics["raw_contrast"],
+        "cdp_black_ratio": safe_float(metrics.get("cdp_black_ratio"), 0.0),
+        "raw_shadow_score": raw_metrics["raw_shadow_score"],
+        "raw_glare_ratio": raw_metrics["raw_glare_ratio"],
+        "mean_reproj_error": metrics["mean_reproj_error"],
+        "max_reproj_error": metrics["max_reproj_error"],
+        "marker_size_cv": metrics["marker_size_cv"],
+        "gate_status": decision.get("status"),
+        "quality_gate_score": decision.get("quality_gate_score"),
+        "gate_reasons": decision.get("reasons", []),
+        "checks": checks,
+        "message": user_message_from_gate(decision),
         "frame": {"w": w, "h": h},
+        "server_crop": {**crop_info, **crop_quality, "crop_error": crop_error},
+        "thresholds": CAMERA_QUALITY_CONFIG,
     }
     return JSONResponse(json_safe(guide))
 
@@ -798,6 +1089,20 @@ async def api_preview_capture(mode: str, file: UploadFile = File(...), quality_j
         client_quality = {}
 
     normalized_img, debug_img, crop_info = normalize_cdp_from_full_frame(full_img)
+    try:
+        crop_info.update(compute_raw_image_metrics_for_gate(full_img))
+        crop_info.update(compute_crop_quality_metrics_for_gate(normalized_img))
+        crop_info["quality_decision"] = camera_quality_decision({
+            **crop_info,
+            "marker_count": int(crop_info.get("marker_count", 0) or 0),
+            "white_position": crop_info.get("white_position", "bottom_4"),
+            "mean_reproj_error": safe_float(crop_info.get("mean_reproj_error"), max(0.0, (1.0 - safe_float(crop_info.get("confidence"), 0.0)) * 3.0)),
+            "max_reproj_error": safe_float(crop_info.get("max_reproj_error"), max(0.0, (1.0 - safe_float(crop_info.get("confidence"), 0.0)) * 8.0)),
+            "marker_size_cv": safe_float(crop_info.get("marker_size_cv"), max(0.06, min(0.18, 0.18 - safe_float(crop_info.get("confidence"), 0.0) * 0.10))),
+            "raw_aspect": safe_float(crop_info.get("raw_aspect"), 1.46),
+        })
+    except Exception as e:
+        crop_info["quality_metric_error"] = str(e)
 
     capture_id = new_id(mode)
     pending_full_path = os.path.join(PENDING_DIR, f"{capture_id}_full.jpg")
