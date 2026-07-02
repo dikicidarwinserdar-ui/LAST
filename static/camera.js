@@ -235,46 +235,34 @@ function computeClientMotion() {
 
 async function sendLiveFrameToBackend() {
   if (!currentMode || isUploading || !video.videoWidth || !video.videoHeight) return;
-
   try {
     const liveW = QUALITY.liveWidth;
     const liveH = Math.round(liveW * video.videoHeight / video.videoWidth);
-
     analysisCanvas.width = liveW;
     analysisCanvas.height = liveH;
-
     const ctx = analysisCanvas.getContext("2d");
     ctx.drawImage(video, 0, 0, liveW, liveH);
-
     const blob = await new Promise(resolve => analysisCanvas.toBlob(resolve, "image/jpeg", QUALITY.liveJpegQuality));
     if (!blob) return;
-
     const fd = new FormData();
     fd.append("file", blob, `live_${Date.now()}.jpg`);
-
     const res = await fetch("/api/live-detect", { method: "POST", body: fd });
     const data = await res.json();
-
     if (!res.ok) throw new Error(data.detail || "live detect failed");
 
     const motion = computeClientMotion();
-
     data.client_motion = motion;
     data.client_motion_ok = motion <= QUALITY.maxMotion;
     data.really_ready = !!data.ready && data.client_motion_ok;
     lastLive = data;
 
-    if (data.really_ready) {
-      stableReadyCount += 1;
-    } else {
-      stableReadyCount = 0;
-    }
+    if (data.really_ready) stableReadyCount += 1;
+    else stableReadyCount = 0;
 
     updateQualityUI(data);
 
     if (stableReadyCount >= QUALITY.stableFramesRequired) {
       const now = Date.now();
-
       if (now - lastCaptureAt > QUALITY.cooldownMs) {
         lastCaptureAt = now;
         captureAndPreview();
@@ -291,12 +279,7 @@ function getVideoDisplayMapping() {
   const rect = video.getBoundingClientRect();
   const videoRatio = video.videoWidth / Math.max(1, video.videoHeight);
   const boxRatio = rect.width / Math.max(1, rect.height);
-
-  let drawW;
-  let drawH;
-  let offsetX;
-  let offsetY;
-
+  let drawW, drawH, offsetX, offsetY;
   if (videoRatio > boxRatio) {
     drawH = rect.height;
     drawW = drawH * videoRatio;
@@ -308,13 +291,11 @@ function getVideoDisplayMapping() {
     offsetX = 0;
     offsetY = (rect.height - drawH) / 2;
   }
-
   return { rect, drawW, drawH, offsetX, offsetY };
 }
 
 function mapPointToDisplay(point, frame) {
   const map = getVideoDisplayMapping();
-
   return {
     x: map.offsetX + (point[0] / frame.w) * map.drawW,
     y: map.offsetY + (point[1] / frame.h) * map.drawH
@@ -328,16 +309,12 @@ function drawLoop() {
 
 function drawOverlay(live) {
   if (!overlayCanvas || !video) return;
-
   const rect = video.getBoundingClientRect();
-
   overlayCanvas.width = rect.width;
   overlayCanvas.height = rect.height;
-
   const ctx = overlayCanvas.getContext("2d");
   const cw = overlayCanvas.width;
   const ch = overlayCanvas.height;
-
   ctx.clearRect(0, 0, cw, ch);
 
   ctx.save();
@@ -359,11 +336,7 @@ function drawOverlay(live) {
 
   ctx.beginPath();
   ctx.moveTo(pts[0].x, pts[0].y);
-
-  for (let i = 1; i < pts.length; i++) {
-    ctx.lineTo(pts[i].x, pts[i].y);
-  }
-
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
   ctx.closePath();
   ctx.fillStyle = fill;
   ctx.fill();
@@ -386,13 +359,11 @@ function drawOverlay(live) {
   ctx.fillText(ready ? "YAKALANDI — NETLEŞTİ — ÇEKİLİYOR" : "YAKALANDI — SABİT TUT / NETLEŞİYOR", 18, 34);
   ctx.font = "13px Arial";
   ctx.fillText(`Backend: ${live.method || "-"} | Conf: ${Math.round((live.confidence || 0) * 100)}% | Markers: ${live.marker_count ?? 0}`, 18, 58);
-
   ctx.restore();
 }
 
 function updateQualityUI(live) {
   if (!live) return;
-
   focusVal.textContent = live.focus !== undefined ? Math.round(live.focus) : "--";
   brightnessVal.textContent = live.brightness !== undefined ? Math.round(live.brightness) : "--";
   contrastVal.textContent = live.contrast !== undefined ? Math.round(live.contrast) : "--";
@@ -413,7 +384,6 @@ function updateQualityUI(live) {
   }
 
   const issues = [];
-
   if (!live.found) issues.push("CDP/marker henüz yakalanmadı");
   if (live.checks && !live.checks.focus) issues.push("netlik düşük");
   if (live.checks && !live.checks.brightness) issues.push("ışık uygun değil");
@@ -427,17 +397,14 @@ function updateQualityUI(live) {
 
 async function captureAndPreview() {
   if (!currentMode || isUploading) return;
-
   isUploading = true;
   setOverlay("Çekiliyor", "ready");
 
   try {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-
     captureCanvas.width = vw;
     captureCanvas.height = vh;
-
     const ctx = captureCanvas.getContext("2d");
     ctx.drawImage(video, 0, 0, vw, vh);
 
@@ -445,29 +412,22 @@ async function captureAndPreview() {
     if (!blob) throw new Error("Capture blob oluşturulamadı.");
 
     const fd = new FormData();
-
     fd.append("file", blob, `${currentMode}_${Date.now()}_fullframe_backend_live.jpg`);
     fd.append("quality_json", JSON.stringify(buildQualityPayload()));
 
     const res = await fetch(`/api/preview/${currentMode}`, { method: "POST", body: fd });
     const data = await res.json();
-
     if (!res.ok) throw new Error(data.detail || "Preview upload failed");
 
     pendingData = data;
-
     const previewUrl = data.server_debug_image_url || data.pending_image_url;
     pendingImage.src = `${previewUrl}?t=${Date.now()}`;
-
     setStatusBox(pendingStatus, data);
     resultBox.textContent = JSON.stringify(data, null, 2);
-
     savePendingBtn.textContent = currentMode === "reference" ? "Referans olarak kaydet" : "Bu çekimi kaydet";
     savePendingBtn.disabled = false;
-
     cameraPanel.classList.remove("active");
     pendingPanel.classList.add("active");
-
     stopCamera();
     await loadHealth();
   } catch (err) {
@@ -489,22 +449,17 @@ function buildQualityPayload() {
 
 async function savePending() {
   if (!pendingData || !pendingData.capture_id) return;
-
   savePendingBtn.disabled = true;
   savePendingBtn.textContent = "Kaydediliyor...";
-
   try {
     const res = await fetch(`/api/save/${pendingData.capture_id}`, { method: "POST" });
     const data = await res.json();
-
     if (!res.ok) throw new Error(data.detail || "Save failed");
-
     pendingData = data;
     setStatusBox(pendingStatus, data);
     resultBox.textContent = JSON.stringify(data, null, 2);
     savePendingBtn.textContent = "Kaydedildi";
     savePendingBtn.disabled = true;
-
     await loadHealth();
   } catch (err) {
     savePendingBtn.disabled = false;
@@ -515,20 +470,15 @@ async function savePending() {
 
 async function discardPending() {
   if (pendingData && pendingData.capture_id) {
-    try {
-      await fetch(`/api/pending/${pendingData.capture_id}`, { method: "DELETE" });
-    } catch (err) {}
+    try { await fetch(`/api/pending/${pendingData.capture_id}`, { method: "DELETE" }); } catch (err) {}
   }
-
   pendingData = null;
   pendingPanel.classList.remove("active");
 }
 
 async function retakeCurrentMode() {
   const mode = currentMode || (pendingData && pendingData.mode);
-
   await discardPending();
-
   if (mode) startCamera(mode);
 }
 
@@ -543,31 +493,25 @@ function modeName(mode) {
 
 function scoreLine(label, value) {
   if (value === undefined || value === null || value === "") return "";
-
   return `<div class="score-line"><span>${label}</span><b>${value}</b></div>`;
 }
 
 async function loadSavedRecords() {
   savedGrid.innerHTML = "<div class='hint'>Kayıtlar yükleniyor...</div>";
-
   try {
     const res = await fetch("/api/saved");
     const data = await res.json();
-
     if (!res.ok) throw new Error(data.detail || "Saved records failed");
-
     if (!data.records || data.records.length === 0) {
       savedGrid.innerHTML = "<div class='hint'>Henüz kayıtlı CDP yok.</div>";
       return;
     }
-
     savedGrid.innerHTML = data.records.map(rec => {
       const scores = rec.scores || {};
       const crop = rec.server_crop || {};
       const status = rec.final_user_status || "-";
       const statusClass = status === "ORIGINAL_APPROVED" || status === "REFERENCE_SAVED" ? "ok" : status === "COPY_RISK_REJECTED" ? "bad" : "review";
       const imgUrl = rec.debug_image_url || rec.image_url;
-
       return `
         <div class="saved-card">
           <img src="${imgUrl}?t=${Date.now()}" alt="${rec.record_id}" />
@@ -593,18 +537,10 @@ async function loadSavedRecords() {
 
 navButtons.forEach(btn => btn.addEventListener("click", () => showPage(btn.dataset.page)));
 startModeButtons.forEach(btn => btn.addEventListener("click", () => startCamera(btn.dataset.mode)));
-
-if (stopCameraBtn) {
-  stopCameraBtn.addEventListener("click", () => {
-    stopCamera();
-    cameraPanel.classList.remove("active");
-  });
-}
-
+if (stopCameraBtn) stopCameraBtn.addEventListener("click", () => { stopCamera(); cameraPanel.classList.remove("active"); });
 savePendingBtn.addEventListener("click", savePending);
 retakeBtn.addEventListener("click", retakeCurrentMode);
 discardBtn.addEventListener("click", discardPending);
 refreshSavedBtn.addEventListener("click", loadSavedRecords);
-
 window.addEventListener("beforeunload", stopCamera);
 loadHealth();
